@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-HR-бот для СПА-салона
-Лучшие практики корпоративного общения
+HR-бот для анонимного Pulse-опроса сотрудников
+Оценка лояльности (eNPS) и вовлеченности
+Все ответы анонимны и доступны только админу
 """
 
 import sqlite3
@@ -21,13 +22,12 @@ try:
     from aiogram.types import (
         InlineKeyboardMarkup, InlineKeyboardButton, 
         ReplyKeyboardMarkup, KeyboardButton, 
-        ReplyKeyboardRemove, WebAppInfo
+        ReplyKeyboardRemove
     )
     from aiogram.utils import executor
     from aiogram.dispatcher import FSMContext
     from aiogram.dispatcher.filters.state import State, StatesGroup
     from aiogram.contrib.fsm_storage.memory import MemoryStorage
-    from aiogram.types import ParseMode
 except ImportError:
     os.system("pip install aiogram==2.25.1")
     from aiogram import Bot, Dispatcher, types
@@ -35,22 +35,16 @@ except ImportError:
     from aiogram.types import (
         InlineKeyboardMarkup, InlineKeyboardButton, 
         ReplyKeyboardMarkup, KeyboardButton, 
-        ReplyKeyboardRemove, WebAppInfo
+        ReplyKeyboardRemove
     )
     from aiogram.utils import executor
     from aiogram.dispatcher import FSMContext
     from aiogram.dispatcher.filters.state import State, StatesGroup
     from aiogram.contrib.fsm_storage.memory import MemoryStorage
-    from aiogram.types import ParseMode
 
 # ===================== КОНФИГУРАЦИЯ =====================
 BOT_TOKEN = "8811262187:AAEssO3CfPRKIXJW1Qh3Nxj-je-yKTBJLnc"
-ADMINS = [1024761707]
-
-# ===================== КОНСТАНТЫ =====================
-PASSING_SCORE = 70
-QUESTIONS_PER_ROUND = 10
-MAX_ATTEMPTS_PER_DAY = 3
+ADMINS = [1024761707
 
 # ===================== ИНИЦИАЛИЗАЦИЯ =====================
 logging.basicConfig(
@@ -69,8 +63,9 @@ class RegistrationStates(StatesGroup):
     waiting_for_position = State()
     waiting_for_phone = State()
 
-class QuizStates(StatesGroup):
+class SurveyStates(StatesGroup):
     answering = State()
+    waiting_for_comment = State()
 
 class AdminStates(StatesGroup):
     waiting_for_broadcast = State()
@@ -90,6 +85,7 @@ class Database:
         self._create_indexes()
     
     def _create_tables(self):
+        # Сотрудники (личные данные)
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS employees (
                 user_id INTEGER PRIMARY KEY,
@@ -97,92 +93,83 @@ class Database:
                 department TEXT,
                 position TEXT,
                 phone TEXT,
-                email TEXT,
                 registered_at TEXT,
                 is_admin INTEGER DEFAULT 0,
-                total_attempts INTEGER DEFAULT 0,
-                best_score REAL DEFAULT 0,
-                best_time INTEGER DEFAULT 999999,
                 is_active INTEGER DEFAULT 1,
                 last_active TEXT
             )
         ''')
         
+        # Вопросы для пульс-опроса
         self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS questions (
+            CREATE TABLE IF NOT EXISTS survey_questions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 question_text TEXT,
-                option_a TEXT,
-                option_b TEXT,
-                option_c TEXT,
-                option_d TEXT,
-                correct_answer TEXT,
-                category TEXT DEFAULT 'СПА',
-                difficulty INTEGER DEFAULT 1,
+                category TEXT DEFAULT 'Лояльность',
+                is_active INTEGER DEFAULT 1,
                 created_at TEXT
             )
         ''')
         
+        # Ответы на пульс-опрос (АНОНИМНЫЕ - без user_id!)
         self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS quiz_results (
+            CREATE TABLE IF NOT EXISTS survey_answers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
+                question_id INTEGER,
+                answer_score INTEGER,
+                comment TEXT,
                 date TEXT,
-                total_questions INTEGER,
-                correct_answers INTEGER,
-                score REAL,
-                passed INTEGER,
-                category TEXT,
-                time_spent INTEGER,
-                attempt_number INTEGER
+                department TEXT,
+                user_hash TEXT
             )
         ''')
         
+        # Для отслеживания, кто уже прошел опрос (без привязки к ответам)
         self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS active_quizzes (
+            CREATE TABLE IF NOT EXISTS survey_participants (
+                user_id INTEGER PRIMARY KEY,
+                last_survey_date TEXT,
+                survey_hash TEXT
+            )
+        ''')
+        
+        # Активные опросы
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS active_surveys (
                 user_id INTEGER PRIMARY KEY,
                 questions TEXT,
                 current_index INTEGER,
-                correct_count INTEGER,
-                total_asked INTEGER,
-                category TEXT,
-                start_time INTEGER
+                total_answered INTEGER,
+                start_time INTEGER,
+                answers TEXT
             )
         ''')
         
+        # Обратная связь (анонимная)
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS feedback (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
                 text TEXT,
                 rating INTEGER,
                 date TEXT,
+                department TEXT,
                 status TEXT DEFAULT 'new'
-            )
-        ''')
-        
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS quiz_daily_limits (
-                user_id INTEGER,
-                date TEXT,
-                attempts INTEGER DEFAULT 0,
-                PRIMARY KEY (user_id, date)
             )
         ''')
         self.conn.commit()
     
     def _create_indexes(self):
-        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_results_user ON quiz_results(user_id)')
-        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_results_date ON quiz_results(date)')
+        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_answers_date ON survey_answers(date)')
+        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_answers_dept ON survey_answers(department)')
         self.conn.commit()
     
     # ---- Сотрудники ----
-    def register_employee(self, user_id, full_name, department, position, phone=None, email=None):
+    def register_employee(self, user_id, full_name, department, position, phone=None):
         self.cursor.execute('''
             INSERT OR REPLACE INTO employees 
-            (user_id, full_name, department, position, phone, email, registered_at, last_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, full_name, department, position, phone, email, datetime.now().isoformat(), datetime.now().isoformat()))
+            (user_id, full_name, department, position, phone, registered_at, last_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, full_name, department, position, phone, datetime.now().isoformat(), datetime.now().isoformat()))
         self.conn.commit()
         return True
     
@@ -201,7 +188,7 @@ class Database:
     
     def get_all_employees(self):
         self.cursor.execute('''
-            SELECT user_id, full_name, department, position, phone, total_attempts, best_score, best_time, is_active 
+            SELECT user_id, full_name, department, position, phone, is_active 
             FROM employees ORDER BY full_name
         ''')
         return self.cursor.fetchall()
@@ -215,320 +202,188 @@ class Database:
                            (datetime.now().isoformat(), user_id))
         self.conn.commit()
     
-    def update_stats(self, user_id, score, time_spent):
-        self.cursor.execute('SELECT total_attempts, best_score, best_time FROM employees WHERE user_id = ?', (user_id,))
+    def get_employee_department(self, user_id):
+        self.cursor.execute('SELECT department FROM employees WHERE user_id = ?', (user_id,))
         result = self.cursor.fetchone()
-        if result:
-            attempts = result[0] + 1
-            best_score = max(result[1] or 0, score)
-            best_time = min(result[2] or 999999, time_spent)
-            self.cursor.execute('''
-                UPDATE employees SET total_attempts = ?, best_score = ?, best_time = ?, last_active = ?
-                WHERE user_id = ?
-            ''', (attempts, best_score, best_time, datetime.now().isoformat(), user_id))
-            self.conn.commit()
+        return result[0] if result else None
     
-    # ---- Вопросы ----
-    def add_question(self, question_text, options, correct_answer, category="СПА", difficulty=1):
+    # ---- Вопросы для опроса ----
+    def add_survey_question(self, question_text, category="Лояльность"):
         self.cursor.execute('''
-            INSERT INTO questions (question_text, option_a, option_b, option_c, option_d, correct_answer, category, difficulty, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (question_text, options[0], options[1], options[2], options[3], correct_answer, category, difficulty, datetime.now().isoformat()))
+            INSERT INTO survey_questions (question_text, category, created_at)
+            VALUES (?, ?, ?)
+        ''', (question_text, category, datetime.now().isoformat()))
         self.conn.commit()
         return self.cursor.lastrowid
     
-    def get_all_questions(self):
-        self.cursor.execute('SELECT * FROM questions ORDER BY id')
+    def get_all_survey_questions(self):
+        self.cursor.execute('SELECT * FROM survey_questions WHERE is_active = 1 ORDER BY id')
         return self.cursor.fetchall()
     
     def get_question_by_id(self, question_id):
-        self.cursor.execute('SELECT * FROM questions WHERE id = ?', (question_id,))
+        self.cursor.execute('SELECT * FROM survey_questions WHERE id = ?', (question_id,))
         return self.cursor.fetchone()
     
-    def update_question(self, question_id, question_text, options, correct_answer, category, difficulty):
+    def update_question(self, question_id, question_text, category):
         self.cursor.execute('''
-            UPDATE questions SET question_text = ?, option_a = ?, option_b = ?, option_c = ?, option_d = ?,
-                correct_answer = ?, category = ?, difficulty = ?
+            UPDATE survey_questions SET question_text = ?, category = ?
             WHERE id = ?
-        ''', (question_text, options[0], options[1], options[2], options[3], correct_answer, category, difficulty, question_id))
+        ''', (question_text, category, question_id))
         self.conn.commit()
     
     def delete_question(self, question_id):
-        self.cursor.execute('DELETE FROM questions WHERE id = ?', (question_id,))
+        self.cursor.execute('UPDATE survey_questions SET is_active = 0 WHERE id = ?', (question_id,))
         self.conn.commit()
     
     def count_questions(self):
-        self.cursor.execute('SELECT COUNT(*) FROM questions')
+        self.cursor.execute('SELECT COUNT(*) FROM survey_questions WHERE is_active = 1')
         return self.cursor.fetchone()[0]
     
-    def get_questions_by_category(self, category):
-        self.cursor.execute('SELECT * FROM questions WHERE category = ? ORDER BY RANDOM()', (category,))
-        return self.cursor.fetchall()
-    
-    def get_categories(self):
-        self.cursor.execute('SELECT DISTINCT category FROM questions')
-        return [row[0] for row in self.cursor.fetchall()]
-    
-    # ---- Результаты ----
-    def save_result(self, user_id, total, correct, category, time_spent):
-        score = (correct / total) * 100 if total > 0 else 0
-        passed = 1 if score >= PASSING_SCORE else 0
-        
-        self.cursor.execute('SELECT COUNT(*) FROM quiz_results WHERE user_id = ?', (user_id,))
-        attempt_number = self.cursor.fetchone()[0] + 1
-        
+    # ---- Анонимные ответы ----
+    def save_anonymous_answer(self, question_id, answer_score, comment, department, user_hash):
         self.cursor.execute('''
-            INSERT INTO quiz_results (user_id, date, total_questions, correct_answers, score, passed, category, time_spent, attempt_number)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, datetime.now().isoformat(), total, correct, score, passed, category, time_spent, attempt_number))
-        self.conn.commit()
-        
-        self.update_stats(user_id, score, time_spent)
-        return score, passed, attempt_number
-    
-    def get_user_results(self, user_id, limit=20):
-        self.cursor.execute('''
-            SELECT date, total_questions, correct_answers, score, passed, category, time_spent, attempt_number
-            FROM quiz_results WHERE user_id = ? ORDER BY date DESC LIMIT ?
-        ''', (user_id, limit))
-        return self.cursor.fetchall()
-    
-    def get_leaderboard(self, limit=20):
-        self.cursor.execute('''
-            SELECT 
-                e.user_id, e.full_name, e.department, 
-                e.total_attempts, e.best_score, e.best_time,
-                COUNT(r.id) as attempts,
-                AVG(r.score) as avg_score,
-                SUM(CASE WHEN r.passed = 1 THEN 1 ELSE 0 END) as passed_count,
-                MAX(CASE WHEN r.passed = 1 AND r.attempt_number = 1 THEN 1 ELSE 0 END) as passed_first
-            FROM employees e
-            LEFT JOIN quiz_results r ON e.user_id = r.user_id
-            WHERE e.total_attempts > 0 AND e.is_active = 1
-            GROUP BY e.user_id
-            ORDER BY e.total_attempts ASC, e.best_time ASC
-            LIMIT ?
-        ''', (limit,))
-        return self.cursor.fetchall()
-    
-    def get_admin_stats(self):
-        self.cursor.execute('''
-            SELECT 
-                COUNT(DISTINCT user_id) as total_users,
-                COUNT(*) as total_attempts,
-                AVG(score) as avg_score,
-                SUM(CASE WHEN passed=1 THEN 1 ELSE 0 END) as passed_count,
-                AVG(time_spent) as avg_time,
-                MIN(time_spent) as best_time,
-                (
-                    SELECT full_name FROM employees WHERE user_id IN (
-                        SELECT user_id FROM quiz_results GROUP BY user_id ORDER BY COUNT(*) ASC LIMIT 1
-                    )
-                ) as best_employee,
-                MAX(score) as highest_score
-            FROM quiz_results
-        ''')
-        return self.cursor.fetchone()
-    
-    # ---- Активные викторины ----
-    def save_active_quiz(self, user_id, question_ids, current_index, correct_count, total_asked, category, start_time):
-        self.cursor.execute('''
-            INSERT OR REPLACE INTO active_quizzes (user_id, questions, current_index, correct_count, total_asked, category, start_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, json.dumps(question_ids), current_index, correct_count, total_asked, category, start_time))
-        self.conn.commit()
-    
-    def get_active_quiz(self, user_id):
-        self.cursor.execute('SELECT questions, current_index, correct_count, total_asked, category, start_time FROM active_quizzes WHERE user_id = ?', (user_id,))
-        result = self.cursor.fetchone()
-        if result:
-            return json.loads(result[0]), result[1], result[2], result[3], result[4], result[5]
-        return None, 0, 0, 0, None, None
-    
-    def clear_active_quiz(self, user_id):
-        self.cursor.execute('DELETE FROM active_quizzes WHERE user_id = ?', (user_id,))
-        self.conn.commit()
-    
-    # ---- Обратная связь ----
-    def save_feedback(self, user_id, text, rating=0):
-        self.cursor.execute('''
-            INSERT INTO feedback (user_id, text, rating, date)
-            VALUES (?, ?, ?, ?)
-        ''', (user_id, text, rating, datetime.now().isoformat()))
+            INSERT INTO survey_answers (question_id, answer_score, comment, date, department, user_hash)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (question_id, answer_score, comment, datetime.now().isoformat(), department, user_hash))
         self.conn.commit()
         return self.cursor.lastrowid
     
-    def get_all_feedback(self, status="new"):
-        self.cursor.execute('SELECT * FROM feedback WHERE status = ? ORDER BY date DESC', (status,))
-        return self.cursor.fetchall()
-    
-    def mark_feedback_done(self, feedback_id):
-        self.cursor.execute('UPDATE feedback SET status = "done" WHERE id = ?', (feedback_id,))
-        self.conn.commit()
-    
-    # ---- Дневные лимиты ----
-    def check_daily_limit(self, user_id):
-        today = datetime.now().date().isoformat()
+    def mark_participant(self, user_id, survey_hash):
         self.cursor.execute('''
-            INSERT OR IGNORE INTO quiz_daily_limits (user_id, date, attempts)
-            VALUES (?, ?, 0)
-        ''', (user_id, today))
+            INSERT OR REPLACE INTO survey_participants (user_id, last_survey_date, survey_hash)
+            VALUES (?, ?, ?)
+        ''', (user_id, datetime.now().isoformat(), survey_hash))
         self.conn.commit()
+    
+    def has_participated(self, user_id):
+        self.cursor.execute('SELECT user_id FROM survey_participants WHERE user_id = ?', (user_id,))
+        return self.cursor.fetchone() is not None
+    
+    def get_anonymous_stats(self):
+        """Получение анонимной статистики для админа"""
+        # Общая статистика
+        self.cursor.execute('''
+            SELECT 
+                COUNT(*) as total_answers,
+                AVG(answer_score) as avg_score,
+                MIN(answer_score) as min_score,
+                MAX(answer_score) as max_score,
+                COUNT(DISTINCT department) as dept_count
+            FROM survey_answers
+        ''')
+        general = self.cursor.fetchone()
         
-        self.cursor.execute('SELECT attempts FROM quiz_daily_limits WHERE user_id = ? AND date = ?', (user_id, today))
-        result = self.cursor.fetchone()
-        return result[0] if result else 0
-    
-    def increment_daily_attempts(self, user_id):
-        today = datetime.now().date().isoformat()
+        # Распределение по оценкам
         self.cursor.execute('''
-            UPDATE quiz_daily_limits SET attempts = attempts + 1
-            WHERE user_id = ? AND date = ?
-        ''', (user_id, today))
+            SELECT answer_score, COUNT(*) as count
+            FROM survey_answers
+            GROUP BY answer_score
+            ORDER BY answer_score
+        ''')
+        distribution = self.cursor.fetchall()
+        
+        # По отделам
+        self.cursor.execute('''
+            SELECT department, COUNT(*) as count, AVG(answer_score) as avg_score
+            FROM survey_answers
+            GROUP BY department
+            ORDER BY avg_score DESC
+        ''')
+        by_department = self.cursor.fetchall()
+        
+        # Комментарии
+        self.cursor.execute('''
+            SELECT comment, date, department
+            FROM survey_answers
+            WHERE comment IS NOT NULL AND comment != ''
+            ORDER BY date DESC
+            LIMIT 20
+        ''')
+        comments = self.cursor.fetchall()
+        
+        return general, distribution, by_department, comments
+    
+    # ---- Активные опросы ----
+    def save_active_survey(self, user_id, question_ids, current_index, total_answered, start_time, answers):
+        self.cursor.execute('''
+            INSERT OR REPLACE INTO active_surveys (user_id, questions, current_index, total_answered, start_time, answers)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, json.dumps(question_ids), current_index, total_answered, start_time, json.dumps(answers)))
         self.conn.commit()
+    
+    def get_active_survey(self, user_id):
+        self.cursor.execute('SELECT questions, current_index, total_answered, start_time, answers FROM active_surveys WHERE user_id = ?', (user_id,))
+        result = self.cursor.fetchone()
+        if result:
+            return json.loads(result[0]), result[1], result[2], result[3], json.loads(result[4])
+        return None, 0, 0, None, None
+    
+    def clear_active_survey(self, user_id):
+        self.cursor.execute('DELETE FROM active_surveys WHERE user_id = ?', (user_id,))
+        self.conn.commit()
+    
+    # ---- Обратная связь (анонимная) ----
+    def save_anonymous_feedback(self, text, rating, department):
+        self.cursor.execute('''
+            INSERT INTO feedback (text, rating, date, department)
+            VALUES (?, ?, ?, ?)
+        ''', (text, rating, datetime.now().isoformat(), department))
+        self.conn.commit()
+        return self.cursor.lastrowid
+    
+    def get_all_feedback(self):
+        self.cursor.execute('''
+            SELECT id, text, rating, date, department, status
+            FROM feedback
+            ORDER BY date DESC
+            LIMIT 50
+        ''')
+        return self.cursor.fetchall()
 
 # ===================== БАЗА ДАННЫХ =====================
 db = Database()
 
-# ===================== 100 ВОПРОСОВ ПО СПА =====================
-def init_questions():
+# ===================== ВОПРОСЫ ДЛЯ PULSE-ОПРОСА =====================
+def init_survey_questions():
     if db.count_questions() > 0:
         return
     
-    questions_data = [
-        ("Что такое СПА-процедура?", ["Комплекс оздоровительных процедур", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Какой массаж используется в СПА?", ["Ароматерапевтический", "Спортивный", "Классический", "Лечебный"], "A"),
-        ("Что такое гидротерапия?", ["Лечение водой", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Какая температура для гидромассажа?", ["37-40°C", "20-25°C", "45-50°C", "30-35°C"], "A"),
-        ("Что такое талассотерапия?", ["Лечение морем", "Лечение травами", "Массаж", "Ароматерапия"], "A"),
-        ("Для чего используется скраб в СПА?", ["Отшелушивание", "Увлажнение", "Питание", "Защита"], "A"),
-        ("Что такое обертывание в СПА?", ["Нанесение масок с пленкой", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Какой эффект дает шоколадное обертывание?", ["Антицеллюлитный", "Омоложение", "Увлажнение", "Питание"], "A"),
-        ("Что такое стоун-терапия?", ["Массаж камнями", "Массаж палками", "Массаж руками", "Массаж водой"], "A"),
-        ("Какие масла используются в ароматерапии?", ["Эфирные", "Растительные", "Минеральные", "Синтетические"], "A"),
-        ("Какой массаж считается расслабляющим?", ["Релаксирующий", "Спортивный", "Классический", "Лечебный"], "A"),
-        ("Что такое баночный массаж?", ["Вакуумный массаж", "Ручной массаж", "Камневый массаж", "Водный массаж"], "A"),
-        ("Какой массаж помогает при целлюлите?", ["Антицеллюлитный", "Релаксирующий", "Спортивный", "Точечный"], "A"),
-        ("Что такое лимфодренажный массаж?", ["Улучшение лимфотока", "Расслабление", "Омоложение", "Лечение"], "A"),
-        ("Что такое шиацу?", ["Точечный массаж", "Китайский массаж", "Тайский массаж", "Шведский массаж"], "A"),
-        ("Какое обертывание помогает похудеть?", ["Водорослевое", "Шоколадное", "Грязевое", "Медовое"], "A"),
-        ("Что такое горячее обертывание?", ["Обертывание с подогревом", "Холодное", "Сухое", "Влажное"], "A"),
-        ("Что такое альгинатная маска?", ["Маска на основе водорослей", "Глиняная", "Шоколадная", "Фруктовая"], "A"),
-        ("Какая маска увлажняет кожу?", ["Гидрогелевая", "Глиняная", "Грязевая", "Шоколадная"], "A"),
-        ("Что такое ритуал 'Хаммам'?", ["Турецкая парная", "Финская сауна", "Японская баня", "Русская баня"], "A"),
-        ("Что такое 'Кедровая бочка'?", ["Парная из кедра", "Массаж", "Обертывание", "Пилинг"], "A"),
-        ("Что такое пилинг в СПА?", ["Отшелушивание кожи", "Увлажнение", "Питание", "Защита"], "A"),
-        ("Для чего используется сыворотка?", ["Интенсивный уход", "Очищение", "Тонизирование", "Защита"], "A"),
-        ("Что такое коллагеновая маска?", ["Маска для омоложения", "Увлажнения", "Очищения", "Питания"], "A"),
-        ("Что такое микротоковая терапия?", ["Аппаратная косметология", "Массаж", "Пилинг", "Инъекции"], "A"),
-        ("Что такое RF-лифтинг?", ["Радиочастотный лифтинг", "Лазерный", "Ультразвуковой", "Инъекционный"], "A"),
-        ("Какое масло успокаивает нервную систему?", ["Лаванда", "Мята", "Лимон", "Розмарин"], "A"),
-        ("Какое масло бодрит и тонизирует?", ["Мята", "Лаванда", "Роза", "Сандал"], "A"),
-        ("Что такое диффузор?", ["Устройство для распыления масел", "Массажер", "Крем", "Лосьон"], "A"),
-        ("Что такое душ Шарко?", ["Лечебный душ", "Контрастный", "Циркулярный", "Игольчатый"], "A"),
-        ("Что такое контрастный душ?", ["Чередование горячей и холодной воды", "С солью", "С маслами", "С грязью"], "A"),
-        ("Что такое гидромассажная ванна?", ["Ванна с водным массажем", "Обычная", "Грязевая", "Соляная"], "A"),
-        ("Что такое криотерапия?", ["Лечение холодом", "Лечение теплом", "Лечение водой", "Лечение грязью"], "A"),
-        ("Что такое озонотерапия?", ["Лечение озоном", "Лечение кислородом", "Лечение водой", "Лечение грязью"], "A"),
-        ("Что такое анти-стресс программа?", ["Комплекс релаксации", "Похудения", "Омоложения", "Питания"], "A"),
-        ("Что такое детокс-программа?", ["Очищение организма", "Питание", "Массаж", "Пилинг"], "A"),
-        ("Что такое иглорефлексотерапия?", ["Лечение иглами", "Массаж", "Пилинг", "Инъекции"], "A"),
-        ("Что такое мануальная терапия?", ["Лечение руками", "Массаж", "Гимнастика", "Лечение водой"], "A"),
-        ("Что такое флоатинг?", ["Плавание в соляной камере", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое соляная комната?", ["Галотерапия", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое фитобочка?", ["Парная с травами", "Сауна", "Хаммам", "Офуро"], "A"),
-        ("Что такое парафинотерапия?", ["Лечение парафином", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое брашинг?", ["Чистка щетками", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое альготерапия?", ["Лечение водорослями", "Грязью", "Травами", "Водой"], "A"),
-        ("Что такое фитотерапия?", ["Лечение травами", "Водой", "Грязью", "Маслами"], "A"),
-        ("Что такое глинолечение?", ["Лечение глиной", "Водой", "Травами", "Маслами"], "A"),
-        ("Что такое пелоидотерапия?", ["Лечение грязями", "Водой", "Травами", "Маслами"], "A"),
-        ("Что такое лазеротерапия?", ["Лечение лазером", "Водой", "Травами", "Маслами"], "A"),
-        ("Что такое магнитотерапия?", ["Лечение магнитным полем", "Водой", "Травами", "Маслами"], "A"),
-        ("Что такое ультразвук в СПА?", ["Ультразвуковая терапия", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое инфракрасная сауна?", ["Сауна с ИК-излучением", "Обычная", "Хаммам", "Офуро"], "A"),
-        ("Что такое йога в СПА?", ["Йога в СПА-центре", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое медитация в СПА?", ["Медитация", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое СПА-питание?", ["Здоровое питание", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое СПА-капсула?", ["Косметическая капсула", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Какой массаж делают при остеохондрозе?", ["Лечебный", "Релаксирующий", "Спортивный", "Точечный"], "A"),
-        ("Что такое вакуумная терапия?", ["Лечение вакуумом", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое прессотерапия?", ["Лечение давлением", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое дарсонваль?", ["Аппаратная косметология", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое биоревитализация?", ["Инъекции гиалуроновой кислоты", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое мезотерапия?", ["Инъекции витаминов", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое плазмолифтинг?", ["Инъекции плазмы", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое ботулинотерапия?", ["Инъекции ботокса", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое нитевой лифтинг?", ["Лифтинг нитями", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое контурная пластика?", ["Инъекции филлеров", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое офуро?", ["Японская баня", "Турецкая", "Финская", "Русская"], "A"),
-        ("Что такое римская баня?", ["Парная с горячим паром", "Сауна", "Хаммам", "Ледяная"], "A"),
-        ("Что такое снежная комната?", ["Комната с искусственным снегом", "Холодильная", "Парная", "Сауна"], "A"),
-        ("Что такое СПА-маникюр?", ["Маникюр с СПА-процедурами", "Обычный", "Наращивание", "Педикюр"], "A"),
-        ("Что такое СПА-педикюр?", ["Педикюр с СПА-процедурами", "Обычный", "Наращивание", "Маникюр"], "A"),
-        ("Что такое кнеип-терапия?", ["Водная терапия", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое миофасциальный массаж?", ["Массаж фасций", "Массаж мышц", "Массаж связок", "Массаж суставов"], "A"),
-        ("Какое масло используют при головной боли?", ["Мята", "Лаванда", "Роза", "Иланг-иланг"], "A"),
-        ("Какое масло используют для релаксации?", ["Иланг-иланг", "Мята", "Лимон", "Розмарин"], "A"),
-        ("Что такое ванна с морской солью?", ["Расслабляющая ванна", "Тонизирующая", "Лечебная", "Все варианты"], "D"),
-        ("Какая температура в криокамере?", ["-150°C", "-60°C", "-100°C", "-200°C"], "A"),
-        ("Что такое СПА-коктейль?", ["Напиток с витаминами", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое эко-СПА?", ["СПА с натуральными продуктами", "Синтетический", "Химический", "Алкогольный"], "A"),
-        ("Что такое фитнес-СПА?", ["СПА с фитнесом", "Просто СПА", "Массаж", "Пилинг"], "A"),
-        ("Что такое остеопатия?", ["Лечение костей", "Массаж", "Гимнастика", "Лечение водой"], "A"),
-        ("Какой массаж делают в перчатках?", ["Тайский", "Классический", "Спортивный", "Шведский"], "A"),
-        ("Что такое тайский массаж?", ["Массаж с растяжкой", "Классический", "Спортивный", "Точечный"], "A"),
-        ("Что такое шведский массаж?", ["Классический массаж", "Спортивный", "Тайский", "Точечный"], "A"),
-        ("Что такое точечный массаж?", ["Массаж на точках", "Классический", "Спортивный", "Тайский"], "A"),
-        ("Что такое детский массаж?", ["Массаж для детей", "Классический", "Спортивный", "Лечебный"], "A"),
-        ("Что такое спортивный массаж?", ["Массаж для спортсменов", "Классический", "Релаксирующий", "Лечебный"], "A"),
-        ("Что такое лечебный массаж?", ["Массаж для лечения", "Классический", "Релаксирующий", "Спортивный"], "A"),
-        ("Что такое рефлексотерапия?", ["Лечение на точках", "Массаж", "Гимнастика", "Лечение водой"], "A"),
-        ("Что такое апитерапия?", ["Лечение пчелами", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое гирудотерапия?", ["Лечение пиявками", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое фиточай в СПА?", ["Чай с травами", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое СПА-релакс?", ["Комплекс расслабления", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое СПА-оздоровление?", ["Комплекс оздоровления", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое СПА-красота?", ["Комплекс красоты", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое СПА-молодость?", ["Комплекс омоложения", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Что такое СПА-гармония?", ["Комплекс гармонии", "Массаж", "Пилинг", "Ингаляция"], "A"),
-        ("Какая вода используется в гидротерапии?", ["Минеральная", "Водопроводная", "Морская", "Дистиллированная"], "A"),
-        ("Что такое сухая сауна?", ["Сауна с сухим паром", "Хаммам", "Офуро", "Русская баня"], "A"),
-        ("Что такое влажная сауна?", ["Сауна с влажным паром", "Хаммам", "Офуро", "Русская баня"], "A"),
-        ("Что такое финская сауна?", ["Сухая сауна", "Хаммам", "Офуро", "Русская баня"], "A"),
-        ("Что такое русская баня?", ["Влажная баня", "Хаммам", "Офуро", "Финская сауна"], "A"),
-        ("Что такое японская баня?", ["Офуро", "Хаммам", "Сауна", "Русская баня"], "A"),
-        ("Что такое турецкая баня?", ["Хаммам", "Офуро", "Сауна", "Русская баня"], "A")
+    questions = [
+        "Насколько вы удовлетворены своей работой в компании? (1-10)",
+        "Как вы оцениваете уровень поддержки со стороны руководства? (1-10)",
+        "Насколько вы чувствуете себя вовлеченным в жизнь компании? (1-10)",
+        "Как вы оцениваете возможности для профессионального роста? (1-10)",
+        "Насколько вы довольны уровнем заработной платы? (1-10)",
+        "Как вы оцениваете атмосферу в коллективе? (1-10)",
+        "Насколько вы довольны условиями труда? (1-10)",
+        "Как вы оцениваете баланс между работой и личной жизнью? (1-10)",
+        "Насколько вы гордитесь тем, что работаете в нашей компании? (1-10)",
+        "Порекомендовали бы вы нашу компанию как место работы друзьям? (1-10)"
     ]
     
-    for q in questions_data:
-        db.add_question(q[0], q[1], q[2], "СПА", 1)
+    for q in questions:
+        db.add_survey_question(q, "Лояльность")
     
-    logging.info(f"✅ Добавлено {len(questions_data)} вопросов по СПА-тематике")
+    logging.info(f"✅ Добавлено {len(questions)} вопросов для Pulse-опроса")
 
 # ===================== КЛАВИАТУРЫ =====================
 def get_main_keyboard(user_id):
-    """Главное меню сотрудника"""
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    
-    # Основные кнопки
     keyboard.add(
-        KeyboardButton("📝 Пройти тест"),
-        KeyboardButton("📊 Моя статистика")
+        KeyboardButton("📝 Пройти опрос"),
+        KeyboardButton("📊 Статистика")
     )
     keyboard.add(
-        KeyboardButton("🏆 Рейтинг"),
-        KeyboardButton("💬 Обратная связь")
+        KeyboardButton("💬 Анонимный отзыв"),
+        KeyboardButton("ℹ️ Помощь")
     )
     
-    # Админ-панель (только для админов)
     if db.is_admin(user_id):
         keyboard.add(KeyboardButton("⚙️ Админ-панель"))
     
     return keyboard
 
 def get_admin_keyboard():
-    """Меню администратора"""
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     keyboard.add(
         KeyboardButton("📢 Рассылка"),
@@ -540,7 +395,7 @@ def get_admin_keyboard():
     )
     keyboard.add(
         KeyboardButton("👥 Сотрудники"),
-        KeyboardButton("📊 Статистика")
+        KeyboardButton("📊 Анонимная статистика")
     )
     keyboard.add(
         KeyboardButton("👑 Назначить админа"),
@@ -549,26 +404,16 @@ def get_admin_keyboard():
     keyboard.add(KeyboardButton("🔙 Главное меню"))
     return keyboard
 
-def get_registration_keyboard():
-    """Кнопка для регистрации с номером телефона"""
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
-    keyboard.add(
-        KeyboardButton("📱 Поделиться контактом", request_contact=True)
-    )
-    keyboard.add(KeyboardButton("⏭ Пропустить"))
-    return keyboard
-
-def get_question_keyboard(question_id):
-    """Клавиатура для вопросов"""
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("🅰️ A", callback_data=f"answer_A_{question_id}"),
-        InlineKeyboardButton("🅱️ B", callback_data=f"answer_B_{question_id}")
-    )
-    keyboard.add(
-        InlineKeyboardButton("🅲️ C", callback_data=f"answer_C_{question_id}"),
-        InlineKeyboardButton("🅳️ D", callback_data=f"answer_D_{question_id}")
-    )
+def get_rating_keyboard(question_id):
+    keyboard = InlineKeyboardMarkup(row_width=5)
+    buttons = []
+    for i in range(1, 11):
+        emoji = "🔴" if i <= 3 else "🟡" if i <= 7 else "🟢"
+        buttons.append(InlineKeyboardButton(f"{emoji} {i}", callback_data=f"rate_{i}_{question_id}"))
+    
+    for i in range(0, len(buttons), 5):
+        keyboard.add(*buttons[i:i+5])
+    
     return keyboard
 
 # ===================== ОБРАБОТЧИКИ =====================
@@ -576,15 +421,15 @@ def get_question_keyboard(question_id):
 async def start_command(message: types.Message):
     user_id = message.from_user.id
     
-    # Проверяем регистрацию
     if not db.is_registered(user_id):
         await message.answer(
-            "🌟 *Добро пожаловать в HR-бот СПА-салона!*\n\n"
-            "Здесь вы сможете:\n"
-            "✅ Проверять свои знания по СПА-тематике\n"
-            "✅ Следить за своим рейтингом\n"
-            "✅ Соревноваться с коллегами\n\n"
-            "Для начала работы заполните анкету:",
+            "🌟 *Добро пожаловать в систему Pulse-опроса!*\n\n"
+            "Здесь вы можете анонимно оценить свою удовлетворенность работой.\n\n"
+            "📌 *Важно:*\n"
+            "✅ Все ответы полностью анонимны\n"
+            "✅ Данные видны только HR-отделу\n"
+            "✅ Опрос занимает 2-3 минуты\n\n"
+            "Для начала заполните анкету:",
             parse_mode="Markdown"
         )
         await message.answer("👤 Введите ваше *полное имя* (ФИО):", parse_mode="Markdown")
@@ -595,9 +440,6 @@ async def start_command(message: types.Message):
         
         await message.answer(
             f"👋 *С возвращением, {employee[1]}!*\n\n"
-            f"📊 Попыток: {employee[5]}\n"
-            f"🏆 Лучший результат: {employee[6]:.1f}%\n"
-            f"⏱️ Лучшее время: {employee[7]} сек.\n\n"
             "Выберите действие:",
             parse_mode="Markdown",
             reply_markup=get_main_keyboard(user_id)
@@ -619,12 +461,12 @@ async def process_department(message: types.Message, state: FSMContext):
 @dp.message_handler(state=RegistrationStates.waiting_for_position)
 async def process_position(message: types.Message, state: FSMContext):
     await state.update_data(position=message.text)
-    await message.answer(
-        "📱 *Поделитесь контактом*\n\n"
-        "Это поможет HR-отделу связаться с вами при необходимости.",
-        parse_mode="Markdown",
-        reply_markup=get_registration_keyboard()
-    )
+    await message.answer("📱 *Поделитесь контактом* (или нажмите 'Пропустить'):", 
+                        parse_mode="Markdown",
+                        reply_markup=ReplyKeyboardMarkup(resize_keyboard=True).add(
+                            KeyboardButton("📱 Поделиться контактом", request_contact=True),
+                            KeyboardButton("⏭ Пропустить")
+                        ))
     await RegistrationStates.waiting_for_phone.set()
 
 @dp.message_handler(content_types=['contact'], state=RegistrationStates.waiting_for_phone)
@@ -645,9 +487,8 @@ async def process_phone_contact(message: types.Message, state: FSMContext):
         f"✅ *Регистрация завершена!*\n\n"
         f"👤 {data['full_name']}\n"
         f"🏢 {data['department']}\n"
-        f"💼 {data['position']}\n"
-        f"📱 {phone}\n\n"
-        "Теперь вы можете проходить тестирование!",
+        f"💼 {data['position']}\n\n"
+        "Теперь вы можете пройти анонимный опрос!",
         parse_mode="Markdown",
         reply_markup=get_main_keyboard(message.from_user.id)
     )
@@ -669,7 +510,7 @@ async def process_phone_skip(message: types.Message, state: FSMContext):
             f"👤 {data['full_name']}\n"
             f"🏢 {data['department']}\n"
             f"💼 {data['position']}\n\n"
-            "Теперь вы можете проходить тестирование!",
+            "Теперь вы можете пройти анонимный опрос!",
             parse_mode="Markdown",
             reply_markup=get_main_keyboard(message.from_user.id)
         )
@@ -678,94 +519,123 @@ async def process_phone_skip(message: types.Message, state: FSMContext):
 
 # ===================== ГЛАВНОЕ МЕНЮ =====================
 @dp.message_handler(lambda message: message.text in [
-    "📝 Пройти тест", "📊 Моя статистика", "🏆 Рейтинг", 
-    "💬 Обратная связь", "⚙️ Админ-панель"
+    "📝 Пройти опрос", "📊 Статистика", "💬 Анонимный отзыв",
+    "ℹ️ Помощь", "⚙️ Админ-панель"
 ])
 async def handle_menu(message: types.Message):
     user_id = message.from_user.id
     
-    if message.text == "📝 Пройти тест":
-        await start_quiz(message, user_id)
+    if message.text == "📝 Пройти опрос":
+        await start_survey(message, user_id)
     
-    elif message.text == "📊 Моя статистика":
+    elif message.text == "📊 Статистика":
         await show_user_stats(message, user_id)
     
-    elif message.text == "🏆 Рейтинг":
-        await show_leaderboard(message)
-    
-    elif message.text == "💬 Обратная связь":
+    elif message.text == "💬 Анонимный отзыв":
         await message.answer(
-            "💬 *Обратная связь*\n\n"
+            "💬 *Анонимный отзыв*\n\n"
             "Напишите ваши пожелания, идеи или замечания.\n"
-            "Мы обязательно рассмотрим ваше сообщение!",
+            "Ваше сообщение будет полностью анонимным!",
             parse_mode="Markdown"
         )
         await AdminStates.waiting_for_feedback.set()
+    
+    elif message.text == "ℹ️ Помощь":
+        await message.answer(
+            "ℹ️ *Помощь*\n\n"
+            "📝 *Пройти опрос* - анонимная оценка лояльности (10 вопросов)\n"
+            "📊 *Статистика* - ваша личная статистика участия\n"
+            "💬 *Анонимный отзыв* - оставить анонимное сообщение\n"
+            "⚙️ *Админ-панель* - управление опросом (только для HR)\n\n"
+            "Все ответы полностью анонимны! 🕵️",
+            parse_mode="Markdown"
+        )
     
     elif message.text == "⚙️ Админ-панель":
         if db.is_admin(user_id):
             await message.answer(
                 "⚙️ *Панель администратора*\n\n"
-                "Выберите действие:",
+                "Управление анонимным Pulse-опросом:",
                 parse_mode="Markdown",
                 reply_markup=get_admin_keyboard()
             )
         else:
             await message.answer("⛔ У вас нет прав администратора.")
 
-# ===================== ОБРАТНАЯ СВЯЗЬ =====================
+# ===================== АНОНИМНЫЙ ОТЗЫВ =====================
 @dp.message_handler(state=AdminStates.waiting_for_feedback)
 async def process_feedback(message: types.Message, state: FSMContext):
-    db.save_feedback(message.from_user.id, message.text)
+    department = db.get_employee_department(message.from_user.id) or "Не указан"
+    
+    db.save_anonymous_feedback(
+        message.text,
+        rating=0,
+        department=department
+    )
+    
     await state.finish()
     await message.answer(
-        "✅ Спасибо за ваш отзыв! 🙌\n\n"
-        "Он поможет нам стать лучше.",
+        "✅ *Спасибо за ваш анонимный отзыв!* 🙌\n\n"
+        "Ваше мнение поможет нам стать лучше.",
+        parse_mode="Markdown",
         reply_markup=get_main_keyboard(message.from_user.id)
     )
 
-# ===================== ВИКТОРИНА =====================
-async def start_quiz(message: types.Message, user_id):
-    # Проверяем дневной лимит
-    daily_attempts = db.check_daily_limit(user_id)
-    if daily_attempts >= MAX_ATTEMPTS_PER_DAY:
+# ===================== ОПРОС =====================
+async def start_survey(message: types.Message, user_id):
+    if db.count_questions() == 0:
+        await message.answer("❌ Вопросы для опроса еще не загружены.")
+        return
+    
+    # Проверяем, участвовал ли уже сегодня
+    if db.has_participated(user_id):
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(
+            InlineKeyboardButton("✅ Пройти заново", callback_data="restart_survey"),
+            InlineKeyboardButton("🔙 В меню", callback_data="back_to_menu")
+        )
         await message.answer(
-            f"⏳ *Дневной лимит исчерпан*\n\n"
-            f"Вы уже прошли {MAX_ATTEMPTS_PER_DAY} тестов сегодня.\n"
-            "Попробуйте завтра!",
-            parse_mode="Markdown"
+            "⚠️ *Вы уже проходили опрос*\n\n"
+            "Хотите пройти его заново?",
+            parse_mode="Markdown",
+            reply_markup=keyboard
         )
         return
     
-    if db.count_questions() == 0:
-        await message.answer("❌ Вопросы еще не загружены.")
-        return
-    
-    # Проверяем незавершенный тест
-    questions, current_index, correct_count, total_asked, category, start_time = db.get_active_quiz(user_id)
+    # Проверяем незавершенный опрос
+    questions, current_index, total_answered, start_time, answers = db.get_active_survey(user_id)
     
     if questions and current_index > 0 and current_index < len(questions):
         keyboard = InlineKeyboardMarkup()
         keyboard.add(
-            InlineKeyboardButton("✅ Продолжить", callback_data="continue_quiz"),
-            InlineKeyboardButton("🔄 Начать заново", callback_data="restart_quiz")
+            InlineKeyboardButton("✅ Продолжить", callback_data="continue_survey"),
+            InlineKeyboardButton("🔄 Начать заново", callback_data="restart_survey")
         )
-        await message.answer("⏳ У вас есть незавершенный тест.", reply_markup=keyboard)
+        await message.answer("⏳ У вас есть незавершенный опрос.", reply_markup=keyboard)
         return
     
-    # Берем случайные вопросы
-    all_questions = db.get_all_questions()
-    selected = random.sample(all_questions, min(QUESTIONS_PER_ROUND, len(all_questions)))
-    question_ids = [q[0] for q in selected]
+    # Начинаем новый опрос
+    all_questions = db.get_all_survey_questions()
     
-    db.save_active_quiz(user_id, question_ids, 0, 0, 0, "СПА", int(time.time()))
-    await send_question(message, user_id, 0)
+    await message.answer(
+        "📝 *Анонимный Pulse-опрос*\n\n"
+        "Оцените каждый вопрос по шкале от 1 до 10:\n"
+        "🔴 1-3 - Неудовлетворен\n"
+        "🟡 4-7 - Частично удовлетворен\n"
+        "🟢 8-10 - Полностью удовлетворен\n\n"
+        "Все ответы анонимны! 🕵️",
+        parse_mode="Markdown"
+    )
+    
+    question_ids = [q[0] for q in all_questions]
+    db.save_active_survey(user_id, question_ids, 0, 0, int(time.time()), [])
+    await send_survey_question(message, user_id, 0)
 
-async def send_question(message: types.Message, user_id, index):
-    questions, current_index, correct_count, total_asked, category, start_time = db.get_active_quiz(user_id)
+async def send_survey_question(message: types.Message, user_id, index):
+    questions, current_index, total_answered, start_time, answers = db.get_active_survey(user_id)
     
     if not questions or index >= len(questions):
-        await finish_quiz(message, user_id)
+        await finish_survey(message, user_id)
         return
     
     question_id = questions[index]
@@ -775,187 +645,151 @@ async def send_question(message: types.Message, user_id, index):
         await message.answer("❌ Ошибка загрузки вопроса.")
         return
     
-    question_text = question[1]
-    options = [question[2], question[3], question[4], question[5]]
-    letters = ["A", "B", "C", "D"]
-    
     text = f"📝 *Вопрос {index + 1} из {len(questions)}*\n\n"
-    text += f"*{question_text}*\n\n"
+    text += f"*{question[1]}*\n\n"
+    text += "Оцените от 1 до 10:"
     
-    for i, option in enumerate(options):
-        text += f"{letters[i]}) {option}\n"
-    
-    text += f"\n📂 Категория: {question[6]}"
-    
-    keyboard = get_question_keyboard(question_id)
+    keyboard = get_rating_keyboard(question_id)
     await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
 
-@dp.callback_query_handler(lambda c: c.data.startswith('answer_'))
-async def handle_answer(callback_query: types.CallbackQuery):
+@dp.callback_query_handler(lambda c: c.data.startswith('rate_'))
+async def handle_survey_answer(callback_query: types.CallbackQuery):
     user_id = callback_query.from_user.id
     data = callback_query.data.split('_')
-    selected = data[1]
+    rating = int(data[1])
     question_id = int(data[2])
     
-    question = db.get_question_by_id(question_id)
-    if not question:
-        await callback_query.answer("❌ Ошибка")
-        return
-    
-    questions, current_index, correct_count, total_asked, category, start_time = db.get_active_quiz(user_id)
+    questions, current_index, total_answered, start_time, answers = db.get_active_survey(user_id)
     
     if not questions:
-        await callback_query.answer("❌ Тест не найден")
+        await callback_query.answer("❌ Опрос не найден")
         return
     
-    correct = question[6]
-    is_correct = selected == correct
+    # Сохраняем ответ
+    answers.append({
+        'question_id': question_id,
+        'rating': rating,
+        'timestamp': time.time()
+    })
     
-    if is_correct:
-        correct_count += 1
-    total_asked += 1
     current_index += 1
+    total_answered += 1
     
-    db.save_active_quiz(user_id, questions, current_index, correct_count, total_asked, category, start_time)
+    db.save_active_survey(user_id, questions, current_index, total_answered, start_time, answers)
     
-    await callback_query.answer()
+    # Показываем подтверждение
+    await callback_query.answer(f"✅ Оценка {rating} сохранена")
     
-    if is_correct:
-        await callback_query.message.edit_text(
-            callback_query.message.text + "\n\n✅ *Правильно!* 🎉",
-            parse_mode="Markdown"
-        )
+    # Показываем следующий вопрос или завершаем
+    if current_index >= len(questions):
+        await finish_survey(callback_query.message, user_id)
     else:
-        await callback_query.message.edit_text(
-            callback_query.message.text + f"\n\n❌ *Неправильно!*\n✅ Правильный ответ: *{correct}*",
-            parse_mode="Markdown"
-        )
-    
-    await asyncio.sleep(1.5)
-    await send_question(callback_query.message, user_id, current_index)
+        await callback_query.message.delete()
+        await send_survey_question(callback_query.message, user_id, current_index)
 
-@dp.callback_query_handler(lambda c: c.data == 'continue_quiz')
-async def continue_quiz(callback_query: types.CallbackQuery):
+@dp.callback_query_handler(lambda c: c.data == 'continue_survey')
+async def continue_survey(callback_query: types.CallbackQuery):
     user_id = callback_query.from_user.id
-    questions, current_index, correct_count, total_asked, category, start_time = db.get_active_quiz(user_id)
+    questions, current_index, total_answered, start_time, answers = db.get_active_survey(user_id)
     
     await callback_query.answer()
     await callback_query.message.delete()
-    await send_question(callback_query.message, user_id, current_index)
+    await send_survey_question(callback_query.message, user_id, current_index)
 
-@dp.callback_query_handler(lambda c: c.data == 'restart_quiz')
-async def restart_quiz(callback_query: types.CallbackQuery):
+@dp.callback_query_handler(lambda c: c.data == 'restart_survey')
+async def restart_survey(callback_query: types.CallbackQuery):
     user_id = callback_query.from_user.id
-    db.clear_active_quiz(user_id)
+    db.clear_active_survey(user_id)
     
     await callback_query.answer()
     await callback_query.message.delete()
-    await start_quiz(callback_query.message, user_id)
+    await start_survey(callback_query.message, user_id)
 
-async def finish_quiz(message: types.Message, user_id):
-    questions, current_index, correct_count, total_asked, category, start_time = db.get_active_quiz(user_id)
+@dp.callback_query_handler(lambda c: c.data == 'back_to_menu')
+async def back_to_menu_callback(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    await callback_query.answer()
+    await callback_query.message.delete()
+    await callback_query.message.answer(
+        "🔙 Возврат в меню",
+        reply_markup=get_main_keyboard(user_id)
+    )
+
+async def finish_survey(message: types.Message, user_id):
+    questions, current_index, total_answered, start_time, answers = db.get_active_survey(user_id)
     
-    if not questions or total_asked == 0:
-        await message.answer("❌ Тест не был начат.")
+    if not answers or total_answered == 0:
+        await message.answer("❌ Опрос не был начат.")
         return
     
-    time_spent = int(time.time()) - start_time
-    score, passed, attempt_number = db.save_result(user_id, total_asked, correct_count, category, time_spent)
+    # Сохраняем анонимные ответы
+    department = db.get_employee_department(user_id) or "Не указан"
     
-    # Увеличиваем счетчик дневных попыток
-    db.increment_daily_attempts(user_id)
-    db.clear_active_quiz(user_id)
+    # Генерируем анонимный хэш для этого опроса
+    import hashlib
+    survey_hash = hashlib.md5(f"{user_id}{time.time()}".encode()).hexdigest()[:8]
     
-    minutes = time_spent // 60
-    seconds = time_spent % 60
-    time_str = f"{minutes} мин. {seconds} сек." if minutes > 0 else f"{seconds} сек."
+    for answer in answers:
+        db.save_anonymous_answer(
+            answer['question_id'],
+            answer['rating'],
+            "",  # Комментарий пока пустой
+            department,
+            survey_hash
+        )
     
-    result_text = f"🏁 *Результаты теста*\n\n"
-    result_text += f"📊 Правильных: {correct_count} из {total_asked}\n"
-    result_text += f"📈 Результат: {score:.1f}%\n"
-    result_text += f"⏱️ Время: {time_str}\n"
-    result_text += f"🔄 Попытка №{attempt_number}\n\n"
+    # Отмечаем, что пользователь прошел опрос
+    db.mark_participant(user_id, survey_hash)
+    db.clear_active_survey(user_id)
     
-    if passed:
-        result_text += "✅ *ЗАЧЕТ!* Отлично! 🎉\n"
+    # Рассчитываем средний балл
+    total_score = sum(a['rating'] for a in answers)
+    avg_score = total_score / len(answers)
+    
+    # Определяем уровень лояльности
+    if avg_score >= 8:
+        level = "🟢 Высокий уровень лояльности!"
+        emoji = "🌟"
+    elif avg_score >= 5:
+        level = "🟡 Средний уровень лояльности"
+        emoji = "📊"
     else:
-        result_text += "❌ *НЕЗАЧЕТ!*\nРекомендуем повторить материал."
+        level = "🔴 Низкий уровень лояльности. Мы работаем над улучшением!"
+        emoji = "💪"
     
-    employee = db.get_employee(user_id)
-    if employee:
-        result_text += f"\n📊 Всего попыток: {employee[5]}"
-        result_text += f"\n🏆 Лучший результат: {employee[6]:.1f}%"
-        if employee[7] > 0 and employee[7] < 999999:
-            result_text += f"\n⏱️ Лучшее время: {employee[7]} сек."
-    
-    await message.answer(result_text, parse_mode="Markdown", reply_markup=get_main_keyboard(user_id))
+    await message.answer(
+        f"✅ *Опрос завершен!*\n\n"
+        f"{emoji} {level}\n\n"
+        f"📊 Ваш средний балл: {avg_score:.1f}/10\n"
+        f"📝 Всего вопросов: {len(answers)}\n\n"
+        "Спасибо за участие! Ваше мнение важно для нас. 🙌\n\n"
+        "Все ответы полностью анонимны! 🕵️",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(user_id)
+    )
 
 # ===================== СТАТИСТИКА =====================
 async def show_user_stats(message: types.Message, user_id):
-    results = db.get_user_results(user_id)
-    employee = db.get_employee(user_id)
-    
-    if not results:
-        await message.answer("📊 У вас пока нет результатов. Пройдите тест!")
-        return
-    
-    text = f"📊 *Моя статистика*\n"
-    text += f"👤 {employee[1]}\n\n" if employee else "\n"
-    
-    # Последние 5 попыток
-    text += "📋 *Последние попытки:*\n"
-    for result in results[:5]:
-        date = datetime.fromisoformat(result[0]).strftime("%d.%m")
-        minutes = result[6] // 60
-        seconds = result[6] % 60
-        time_str = f"{minutes}м {seconds}с" if minutes > 0 else f"{seconds}с"
-        passed = "✅" if result[4] else "❌"
-        text += f"#{result[7]}: {date} | {result[1]} вопр. | {result[2]} прав. | {result[3]:.1f}% | ⏱️{time_str} {passed}\n"
-    
-    # Общая статистика
-    avg_score = sum(r[3] for r in results) / len(results)
-    best_score = max(r[3] for r in results)
-    best_time = min(r[6] for r in results)
-    passed_count = sum(1 for r in results if r[4])
-    
-    text += f"\n📈 *Общая статистика:*\n"
-    text += f"📊 Средний: {avg_score:.1f}%\n"
-    text += f"🏆 Лучший: {best_score:.1f}%\n"
-    text += f"⏱️ Лучшее время: {best_time} сек.\n"
-    text += f"✅ Зачетов: {passed_count} из {len(results)}"
-    
-    await message.answer(text, parse_mode="Markdown")
-
-async def show_leaderboard(message: types.Message):
-    leaderboard = db.get_leaderboard()
-    
-    if not leaderboard:
-        await message.answer("🏆 Пока нет данных для рейтинга.")
-        return
-    
-    text = "🏆 *Рейтинг сотрудников*\n"
-    text += "*(Учитывается: количество попыток и время)*\n\n"
-    
-    for i, row in enumerate(leaderboard, 1):
-        user_id, name, dept, total_attempts, best_score, best_time, attempts, avg_score, passed_count, passed_first = row
-        
-        medal = "🥇 " if i == 1 else "🥈 " if i == 2 else "🥉 " if i == 3 else f"{i}. "
-        
-        text += f"{medal}*{name}*\n"
-        text += f"   📊 {dept}\n"
-        text += f"   🔄 Попыток: {total_attempts}\n"
-        text += f"   🏆 Лучший: {best_score:.1f}%\n"
-        text += f"   ⏱️ Время: {best_time} сек.\n"
-        if passed_first:
-            text += "   ⭐ Сдал с 1-й попытки!\n"
-        text += "\n"
-    
-    await message.answer(text, parse_mode="Markdown")
+    if db.has_participated(user_id):
+        await message.answer(
+            "📊 *Ваша статистика*\n\n"
+            "✅ Вы уже прошли анонимный опрос.\n"
+            "Спасибо за ваше участие! 🙌\n\n"
+            "Все ответы полностью анонимны 🕵️",
+            parse_mode="Markdown"
+        )
+    else:
+        await message.answer(
+            "📊 *Статистика*\n\n"
+            "Вы еще не проходили опрос.\n"
+            "Нажмите '📝 Пройти опрос', чтобы принять участие.",
+            parse_mode="Markdown"
+        )
 
 # ===================== АДМИН-ПАНЕЛЬ =====================
 @dp.message_handler(lambda message: message.text in [
     "📢 Рассылка", "➕ Добавить вопрос", "✏️ Редактировать вопрос",
-    "❌ Удалить вопрос", "👥 Сотрудники", "📊 Статистика",
+    "❌ Удалить вопрос", "👥 Сотрудники", "📊 Анонимная статистика",
     "👑 Назначить админа", "💬 Отзывы", "🔙 Главное меню"
 ])
 async def handle_admin_buttons(message: types.Message, state: FSMContext):
@@ -973,36 +807,35 @@ async def handle_admin_buttons(message: types.Message, state: FSMContext):
     
     elif message.text == "➕ Добавить вопрос":
         await message.answer(
-            "📝 *Добавление вопроса*\n\n"
-            "Формат: `Текст | A | B | C | D | Правильный ответ | Категория | Сложность`\n\n"
-            "Пример: `Что такое СПА? | Комплекс | Массаж | Пилинг | Ингаляция | A | СПА | 1`",
+            "📝 *Добавление вопроса для Pulse-опроса*\n\n"
+            "Введите текст вопроса:",
             parse_mode="Markdown"
         )
         await AdminStates.waiting_for_question_add.set()
     
     elif message.text == "✏️ Редактировать вопрос":
-        questions = db.get_all_questions()
+        questions = db.get_all_survey_questions()
         if not questions:
             await message.answer("❌ Вопросов нет.")
             return
         
-        text = "✏️ *Выберите вопрос*\n\n"
+        text = "✏️ *Выберите вопрос для редактирования*\n\n"
         for q in questions[:15]:
-            text += f"ID: {q[0]}. {q[1][:40]}...\n"
+            text += f"ID: {q[0]}. {q[1][:50]}...\n"
         text += "\nВведите ID вопроса:"
         await message.answer(text, parse_mode="Markdown")
         await AdminStates.waiting_for_question_edit.set()
     
     elif message.text == "❌ Удалить вопрос":
-        questions = db.get_all_questions()
+        questions = db.get_all_survey_questions()
         if not questions:
             await message.answer("❌ Вопросов нет.")
             return
         
         text = "❌ *Удаление вопроса*\n\n"
         for q in questions[:15]:
-            text += f"ID: {q[0]}. {q[1][:40]}...\n"
-        text += "\nВведите ID вопроса:"
+            text += f"ID: {q[0]}. {q[1][:50]}...\n"
+        text += "\nВведите ID вопроса для удаления:"
         await message.answer(text, parse_mode="Markdown")
         await AdminStates.waiting_for_question_delete.set()
     
@@ -1012,37 +845,59 @@ async def handle_admin_buttons(message: types.Message, state: FSMContext):
             await message.answer("👥 Нет сотрудников.")
             return
         
-        text = "👥 *Сотрудники*\n\n"
-        for user_id, name, dept, pos, phone, attempts, best_score, best_time, active in employees:
+        text = "👥 *Список сотрудников*\n\n"
+        for user_id, name, dept, pos, phone, active in employees:
             status = "🟢" if active else "🔴"
             text += f"{status} *{name}*\n"
             text += f"   📊 {dept} | {pos}\n"
-            text += f"   🔄 {attempts} попыток\n"
-            text += f"   🏆 {best_score:.1f}% | ⏱️ {best_time} сек.\n"
             if phone:
                 text += f"   📱 {phone}\n"
             text += "\n"
         
         await message.answer(text, parse_mode="Markdown")
     
-    elif message.text == "📊 Статистика":
-        stats = db.get_admin_stats()
+    elif message.text == "📊 Анонимная статистика":
+        general, distribution, by_department, comments = db.get_anonymous_stats()
         
-        text = "📊 *Статистика системы*\n\n"
-        text += f"👥 Сотрудников: {stats[0] or 0}\n"
-        text += f"📝 Попыток: {stats[1] or 0}\n"
-        text += f"📈 Средний балл: {stats[2] or 0:.1f}%\n"
-        text += f"✅ Зачетов: {stats[3] or 0}\n"
-        text += f"⏱️ Среднее время: {stats[4] or 0:.0f} сек.\n"
-        text += f"⚡ Лучшее время: {stats[5] or 0} сек.\n"
-        text += f"🏆 Лучший результат: {stats[7] or 0:.1f}%"
+        text = "📊 *Анонимная статистика Pulse-опроса*\n"
+        text += "*Все данные анонимны*\n\n"
+        
+        if general:
+            text += f"📝 Всего ответов: {general[0] or 0}\n"
+            text += f"📈 Средний балл: {general[1] or 0:.1f}/10\n"
+            text += f"📉 Минимальный балл: {general[2] or 0}\n"
+            text += f"📈 Максимальный балл: {general[3] or 0}\n"
+            text += f"🏢 Отделов: {general[4] or 0}\n\n"
+        
+        # Распределение оценок
+        if distribution:
+            text += "📊 *Распределение оценок:*\n"
+            for score, count in distribution:
+                bar = "█" * min(count, 20)
+                text += f"{score} баллов: {bar} ({count})\n"
+            text += "\n"
+        
+        # По отделам
+        if by_department:
+            text += "🏢 *По отделам:*\n"
+            for dept, count, avg_score in by_department:
+                text += f"📊 {dept}: {avg_score:.1f}/10 ({count} ответов)\n"
+            text += "\n"
+        
+        # Комментарии
+        if comments:
+            text += "💬 *Анонимные комментарии:*\n\n"
+            for comment, date, dept in comments[:10]:
+                d = datetime.fromisoformat(date).strftime("%d.%m %H:%M")
+                text += f"📝 {comment[:200]}\n"
+                text += f"   🏢 {dept} | 🕐 {d}\n\n"
         
         await message.answer(text, parse_mode="Markdown")
     
     elif message.text == "👑 Назначить админа":
         employees = db.get_all_employees()
         text = "👑 *Назначение администратора*\n\nВведите ID пользователя:\n\n"
-        for user_id, name, dept, pos, phone, attempts, score, time_best, active in employees[:10]:
+        for user_id, name, dept, pos, phone, active in employees[:10]:
             is_admin = db.is_admin(user_id)
             status = "✅ Админ" if is_admin else "👤 Сотрудник"
             text += f"ID: `{user_id}` | {name} | {status}\n"
@@ -1052,15 +907,14 @@ async def handle_admin_buttons(message: types.Message, state: FSMContext):
     elif message.text == "💬 Отзывы":
         feedbacks = db.get_all_feedback()
         if not feedbacks:
-            await message.answer("💬 Нет новых отзывов.")
+            await message.answer("💬 Нет отзывов.")
             return
         
-        text = "💬 *Отзывы сотрудников*\n\n"
-        for fb in feedbacks[:10]:
-            date = datetime.fromisoformat(fb[4]).strftime("%d.%m %H:%M")
-            text += f"#{fb[0]} | {date}\n"
-            text += f"👤 ID: {fb[1]}\n"
-            text += f"📝 {fb[2]}\n\n"
+        text = "💬 *Анонимные отзывы*\n\n"
+        for fb in feedbacks[:20]:
+            date = datetime.fromisoformat(fb[3]).strftime("%d.%m %H:%M")
+            text += f"📝 {fb[1][:200]}\n"
+            text += f"   🏢 {fb[4]} | 🕐 {date}\n\n"
         
         await message.answer(text, parse_mode="Markdown")
 
@@ -1070,12 +924,12 @@ async def process_broadcast(message: types.Message, state: FSMContext):
     employees = db.get_all_employees()
     sent = 0
     
-    for user_id, name, dept, pos, phone, attempts, score, time_best, active in employees:
+    for user_id, name, dept, pos, phone, active in employees:
         if active:
             try:
                 await bot.send_message(
                     user_id,
-                    f"📢 *Важное объявление*\n\n{message.text}",
+                    f"📢 *Объявление HR-отдела*\n\n{message.text}",
                     parse_mode="Markdown"
                 )
                 sent += 1
@@ -1088,17 +942,9 @@ async def process_broadcast(message: types.Message, state: FSMContext):
 # ===================== АДМИН: ВОПРОСЫ =====================
 @dp.message_handler(state=AdminStates.waiting_for_question_add)
 async def process_add_question(message: types.Message, state: FSMContext):
-    try:
-        parts = [p.strip() for p in message.text.split('|')]
-        if len(parts) != 8:
-            await message.answer("❌ Нужно 7 разделителей '|'")
-            return
-        
-        db.add_question(parts[0], parts[1:5], parts[5].upper(), parts[6] if parts[6] else "СПА", int(parts[7]) if parts[7].isdigit() else 1)
-        await state.finish()
-        await message.answer("✅ Вопрос добавлен!", reply_markup=get_admin_keyboard())
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {str(e)}")
+    db.add_survey_question(message.text)
+    await state.finish()
+    await message.answer("✅ Вопрос добавлен!", reply_markup=get_admin_keyboard())
 
 @dp.message_handler(state=AdminStates.waiting_for_question_edit)
 async def process_edit_question(message: types.Message, state: FSMContext):
@@ -1112,9 +958,8 @@ async def process_edit_question(message: types.Message, state: FSMContext):
         await state.update_data(edit_id=question_id)
         await message.answer(
             f"✏️ *Редактирование #{question_id}*\n\n"
-            f"Текущий: {question[1]}\n\n"
-            "Введите новые данные в формате:\n"
-            "`Текст | A | B | C | D | Правильный ответ | Категория | Сложность`",
+            f"Текущий текст: {question[1]}\n\n"
+            "Введите новый текст вопроса:",
             parse_mode="Markdown"
         )
         await AdminStates.waiting_for_question_edit_save.set()
@@ -1126,13 +971,8 @@ async def process_edit_question_save(message: types.Message, state: FSMContext):
     try:
         data = await state.get_data()
         question_id = data.get('edit_id')
-        parts = [p.strip() for p in message.text.split('|')]
         
-        if len(parts) != 8:
-            await message.answer("❌ Неверный формат.")
-            return
-        
-        db.update_question(question_id, parts[0], parts[1:5], parts[5].upper(), parts[6], int(parts[7]))
+        db.update_question(question_id, message.text, "Лояльность")
         await state.finish()
         await message.answer("✅ Вопрос обновлен!", reply_markup=get_admin_keyboard())
     except Exception as e:
@@ -1167,7 +1007,6 @@ async def process_assign_admin(message: types.Message, state: FSMContext):
         await state.finish()
         await message.answer(f"✅ {employee[1]} назначен администратором!", reply_markup=get_admin_keyboard())
         
-        # Уведомляем пользователя
         try:
             await bot.send_message(
                 user_id,
@@ -1195,21 +1034,19 @@ async def unknown_command(message: types.Message):
         )
 
 # ===================== ЗАПУСК =====================
-import asyncio
-
 if __name__ == "__main__":
-    print("🚀 Запуск HR-бота для СПА-салона...")
-    print("=" * 40)
+    print("🚀 Запуск HR-бота для Pulse-опроса...")
+    print("=" * 50)
     
     try:
         # Инициализация вопросов
-        init_questions()
+        init_survey_questions()
         
         print(f"✅ Бот запущен успешно!")
         print(f"👤 Администраторы: {ADMINS}")
         print(f"📊 Всего вопросов: {db.count_questions()}")
-        print(f"📝 Дневной лимит: {MAX_ATTEMPTS_PER_DAY} попыток")
-        print("=" * 40)
+        print(f"🕵️ Все ответы анонимны!")
+        print("=" * 50)
         print("💬 Бот готов к работе...")
         
         executor.start_polling(dp, skip_updates=True)
