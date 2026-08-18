@@ -3,8 +3,7 @@
 
 """
 HR-бот для анонимного Pulse-опроса
-Сбор: должность и стаж (без имени)
-Анонимная статистика для админа
+КАЖДЫЙ СОТРУДНИК = ОДНА ЗАПИСЬ (со всеми ответами)
 """
 
 import sqlite3
@@ -105,19 +104,21 @@ class Database:
             )
         ''')
         
-        # АНОНИМНЫЕ ответы (без user_id!)
+        # АНОНИМНЫЕ ответы - ОДНА ЗАПИСЬ НА СОТРУДНИКА!
+        # Вся статистика по одному сотруднику в одной строке
         self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS survey_answers (
+            CREATE TABLE IF NOT EXISTS survey_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                question_id INTEGER,
-                answer_score INTEGER,
                 position TEXT,
                 experience TEXT,
-                date TEXT
+                answers_json TEXT,  -- все ответы в JSON: {"1": 8, "2": 9, ...}
+                avg_score REAL,
+                date TEXT,
+                participant_hash TEXT  -- анонимный хэш для проверки участия
             )
         ''')
         
-        # Для отслеживания участия
+        # Для отслеживания участия (только факт)
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS survey_participants (
                 user_id INTEGER PRIMARY KEY,
@@ -162,10 +163,6 @@ class Database:
                            (user_id, datetime.now().isoformat()))
         self.conn.commit()
     
-    def get_all_admins(self):
-        self.cursor.execute('SELECT user_id FROM admins')
-        return [row[0] for row in self.cursor.fetchall()]
-    
     # ---- Вопросы ----
     def add_question(self, question_text):
         self.cursor.execute('''
@@ -196,12 +193,18 @@ class Database:
         self.cursor.execute('SELECT COUNT(*) FROM survey_questions WHERE is_active = 1')
         return self.cursor.fetchone()[0]
     
-    # ---- Анонимные ответы ----
-    def save_anonymous_answer(self, question_id, answer_score, position, experience):
+    # ---- Анонимные ответы (ОДНА ЗАПИСЬ НА СОТРУДНИКА) ----
+    def save_survey_result(self, position, experience, answers_dict, avg_score):
+        """Сохраняет все ответы одного сотрудника в одну запись"""
+        import hashlib
+        # Генерируем анонимный хэш
+        hash_str = f"{position}{experience}{datetime.now().timestamp()}"
+        participant_hash = hashlib.md5(hash_str.encode()).hexdigest()[:8]
+        
         self.cursor.execute('''
-            INSERT INTO survey_answers (question_id, answer_score, position, experience, date)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (question_id, answer_score, position, experience, datetime.now().isoformat()))
+            INSERT INTO survey_results (position, experience, answers_json, avg_score, date, participant_hash)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (position, experience, json.dumps(answers_dict), avg_score, datetime.now().isoformat(), participant_hash))
         self.conn.commit()
         return self.cursor.lastrowid
     
@@ -219,31 +222,38 @@ class Database:
     def get_anonymous_stats(self):
         """Полная анонимная статистика для админа"""
         
-        # Общая статистика
+        # Общая статистика по сотрудникам (НЕ по ответам!)
         self.cursor.execute('''
             SELECT 
-                COUNT(*) as total_answers,
-                AVG(answer_score) as avg_score,
-                MIN(answer_score) as min_score,
-                MAX(answer_score) as max_score,
+                COUNT(*) as total_participants,
+                AVG(avg_score) as avg_score,
+                MIN(avg_score) as min_score,
+                MAX(avg_score) as max_score,
                 COUNT(DISTINCT position) as positions_count
-            FROM survey_answers
+            FROM survey_results
         ''')
         general = self.cursor.fetchone()
         
-        # Распределение по оценкам
+        # Распределение средних оценок
         self.cursor.execute('''
-            SELECT answer_score, COUNT(*) as count
-            FROM survey_answers
-            GROUP BY answer_score
-            ORDER BY answer_score
+            SELECT 
+                CASE 
+                    WHEN avg_score >= 8 THEN '🟢 Высокий (8-10)'
+                    WHEN avg_score >= 5 THEN '🟡 Средний (5-7)'
+                    ELSE '🔴 Низкий (1-4)'
+                END as level,
+                COUNT(*) as count,
+                AVG(avg_score) as avg_score
+            FROM survey_results
+            GROUP BY level
+            ORDER BY avg_score DESC
         ''')
-        distribution = self.cursor.fetchall()
+        by_level = self.cursor.fetchall()
         
         # По должностям
         self.cursor.execute('''
-            SELECT position, COUNT(*) as count, AVG(answer_score) as avg_score
-            FROM survey_answers
+            SELECT position, COUNT(*) as count, AVG(avg_score) as avg_score
+            FROM survey_results
             GROUP BY position
             ORDER BY avg_score DESC
         ''')
@@ -251,24 +261,42 @@ class Database:
         
         # По стажу
         self.cursor.execute('''
-            SELECT experience, COUNT(*) as count, AVG(answer_score) as avg_score
-            FROM survey_answers
+            SELECT experience, COUNT(*) as count, AVG(avg_score) as avg_score
+            FROM survey_results
             GROUP BY experience
             ORDER BY experience
         ''')
         by_experience = self.cursor.fetchall()
         
-        # eNPS (доля рекомендующих)
-        self.cursor.execute('''
-            SELECT 
-                SUM(CASE WHEN answer_score >= 9 THEN 1 ELSE 0 END) as promoters,
-                SUM(CASE WHEN answer_score <= 6 THEN 1 ELSE 0 END) as detractors,
-                COUNT(*) as total
-            FROM survey_answers
-        ''')
-        enps_data = self.cursor.fetchone()
+        # eNPS (на основе последнего вопроса, обычно 10-й)
+        # Ищем вопрос "Порекомендовали бы вы..."
+        self.cursor.execute('SELECT id FROM survey_questions WHERE question_text LIKE "%рекомендовал%" LIMIT 1')
+        enps_question = self.cursor.fetchone()
         
-        return general, distribution, by_position, by_experience, enps_data
+        enps_data = None
+        if enps_question:
+            question_id = enps_question[0]
+            # Извлекаем оценки по этому вопросу из всех записей
+            self.cursor.execute('''
+                SELECT 
+                    SUM(CASE WHEN CAST(json_extract(answers_json, '$."' || ? || '"') AS INTEGER) >= 9 THEN 1 ELSE 0 END) as promoters,
+                    SUM(CASE WHEN CAST(json_extract(answers_json, '$."' || ? || '"') AS INTEGER) <= 6 THEN 1 ELSE 0 END) as detractors,
+                    COUNT(*) as total
+                FROM survey_results
+            ''', (str(question_id), str(question_id)))
+            enps_data = self.cursor.fetchone()
+        
+        # Комментарии (если есть)
+        # Показываем примеры ответов (анонимно)
+        self.cursor.execute('''
+            SELECT position, experience, avg_score, date
+            FROM survey_results
+            ORDER BY date DESC
+            LIMIT 10
+        ''')
+        recent = self.cursor.fetchall()
+        
+        return general, by_level, by_position, by_experience, enps_data, recent
     
     # ---- Активные опросы ----
     def save_active_survey(self, user_id, question_ids, current_index, answers):
@@ -357,11 +385,6 @@ def get_rating_keyboard(question_id):
     
     return keyboard
 
-def get_back_keyboard():
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu"))
-    return keyboard
-
 # ===================== ОБРАБОТЧИКИ =====================
 @dp.message_handler(commands=['start'])
 async def start_command(message: types.Message):
@@ -388,7 +411,7 @@ async def start_command(message: types.Message):
             reply_markup=get_main_keyboard(user_id)
         )
 
-# ===================== РЕГИСТРАЦИЯ (только должность и стаж) =====================
+# ===================== РЕГИСТРАЦИЯ =====================
 @dp.message_handler(state=RegistrationStates.waiting_for_position)
 async def process_position(message: types.Message, state: FSMContext):
     await state.update_data(position=message.text)
@@ -499,7 +522,7 @@ async def start_survey(message: types.Message, user_id):
     )
     
     question_ids = [q[0] for q in all_questions]
-    db.save_active_survey(user_id, question_ids, 0, [])
+    db.save_active_survey(user_id, question_ids, 0, {})
     await send_question(message, user_id, 0)
 
 async def send_question(message: types.Message, user_id, index):
@@ -536,10 +559,8 @@ async def handle_survey_answer(callback_query: types.CallbackQuery):
         await callback_query.answer("❌ Опрос не найден")
         return
     
-    answers.append({
-        'question_id': question_id,
-        'rating': rating
-    })
+    # Сохраняем ответ в словарь {question_id: rating}
+    answers[str(question_id)] = rating
     
     current_index += 1
     db.save_active_survey(user_id, questions, current_index, answers)
@@ -592,20 +613,14 @@ async def finish_survey(message: types.Message, user_id):
     position = employee[0] if employee else "Не указана"
     experience = employee[1] if employee else "Не указан"
     
-    # Сохраняем анонимные ответы
-    for answer in answers:
-        db.save_anonymous_answer(
-            answer['question_id'],
-            answer['rating'],
-            position,
-            experience
-        )
+    # Считаем средний балл
+    total_score = sum(answers.values())
+    avg_score = total_score / len(answers) if answers else 0
     
+    # Сохраняем ВСЕ ответы в ОДНУ запись
+    db.save_survey_result(position, experience, answers, avg_score)
     db.mark_participant(user_id)
     db.clear_active_survey(user_id)
-    
-    total_score = sum(a['rating'] for a in answers)
-    avg_score = total_score / len(answers)
     
     if avg_score >= 8:
         level = "🟢 Высокий уровень лояльности!"
@@ -700,17 +715,24 @@ async def handle_admin_buttons(message: types.Message, state: FSMContext):
         await AdminStates.waiting_for_question_delete.set()
     
     elif message.text == "📊 Анонимная статистика":
-        general, distribution, by_position, by_experience, enps_data = db.get_anonymous_stats()
+        general, by_level, by_position, by_experience, enps_data, recent = db.get_anonymous_stats()
         
         text = "📊 *АНОНИМНАЯ СТАТИСТИКА PULSE-ОПРОСА*\n"
-        text += "*Все данные анонимны*\n\n"
+        text += "*КАЖДЫЙ СОТРУДНИК = 1 ЗАПИСЬ*\n\n"
         
         if general:
-            text += f"📝 Всего ответов: {general[0] or 0}\n"
+            text += f"👥 Всего участников: {general[0] or 0}\n"
             text += f"📈 Средний балл: {general[1] or 0:.1f}/10\n"
-            text += f"📉 Минимальный балл: {general[2] or 0}\n"
-            text += f"📈 Максимальный балл: {general[3] or 0}\n"
-            text += f"👥 Должностей: {general[4] or 0}\n\n"
+            text += f"📉 Минимальный балл: {general[2] or 0:.1f}\n"
+            text += f"📈 Максимальный балл: {general[3] or 0:.1f}\n"
+            text += f"👔 Должностей: {general[4] or 0}\n\n"
+        
+        # Уровни лояльности
+        if by_level:
+            text += "📊 *Уровни лояльности:*\n"
+            for level, count, avg_score in by_level:
+                text += f"{level}: {count} чел. (ср. {avg_score:.1f})\n"
+            text += "\n"
         
         # eNPS
         if enps_data:
@@ -725,14 +747,6 @@ async def handle_admin_buttons(message: types.Message, state: FSMContext):
             text += f"🔴 Критики (0-6): {detractors}\n"
             text += f"📈 eNPS: {enps_score}\n\n"
         
-        # Распределение оценок
-        if distribution:
-            text += "📊 *Распределение оценок:*\n"
-            for score, count in distribution:
-                bar = "█" * min(count, 20)
-                text += f"{score} баллов: {bar} ({count})\n"
-            text += "\n"
-        
         # По должностям
         if by_position:
             text += "👔 *По должностям:*\n"
@@ -745,6 +759,14 @@ async def handle_admin_buttons(message: types.Message, state: FSMContext):
             text += "📅 *По стажу:*\n"
             for experience, count, avg_score in by_experience:
                 text += f"📊 {experience}: {avg_score:.1f}/10 ({count} чел.)\n"
+            text += "\n"
+        
+        # Последние участники
+        if recent:
+            text += "🕐 *Последние участники:*\n"
+            for position, experience, avg_score, date in recent[:5]:
+                d = datetime.fromisoformat(date).strftime("%d.%m %H:%M")
+                text += f"📊 {position} ({experience}): {avg_score:.1f}/10 | {d}\n"
         
         await message.answer(text, parse_mode="Markdown")
     
@@ -759,7 +781,6 @@ async def handle_admin_buttons(message: types.Message, state: FSMContext):
 # ===================== АДМИН: РАССЫЛКА =====================
 @dp.message_handler(state=AdminStates.waiting_for_broadcast)
 async def process_broadcast(message: types.Message, state: FSMContext):
-    # Получаем всех зарегистрированных пользователей
     db.cursor.execute('SELECT user_id FROM employees')
     users = db.cursor.fetchall()
     sent = 0
@@ -873,17 +894,16 @@ if __name__ == "__main__":
     print("=" * 50)
     
     try:
-        # Добавляем админов из списка
         for admin_id in ADMINS:
             db.add_admin(admin_id)
         
-        # Инициализация вопросов
         init_survey_questions()
         
         print(f"✅ Бот запущен успешно!")
         print(f"👤 Администраторы: {ADMINS}")
         print(f"📊 Всего вопросов: {db.count_questions()}")
         print(f"🕵️ Все ответы анонимны!")
+        print(f"📝 Каждый сотрудник = 1 запись")
         print("=" * 50)
         print("💬 Бот готов к работе...")
         
