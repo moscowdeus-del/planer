@@ -2,1188 +2,733 @@
 # -*- coding: utf-8 -*-
 
 """
-HR-бот для анонимных Pulse-опросов
-- Анонимные тесты: Лояльность, Выгорание, Вовлеченность, Стресс
-- Топ сотрудников по отделам (анонимно)
-- Полная админ-панель
+Планировщик задач с календарём, погодой и напоминаниями
 """
 
-import sqlite3
-import random
-import time
-import json
-import logging
-from datetime import datetime, timedelta
 import os
-import sys
-import hashlib
+import logging
+import sqlite3
+import json
+from datetime import datetime, timedelta
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-try:
-    from aiogram import Bot, Dispatcher, types
-    from aiogram.contrib.middlewares.logging import LoggingMiddleware
-    from aiogram.types import (
-        InlineKeyboardMarkup, InlineKeyboardButton, 
-        ReplyKeyboardMarkup, KeyboardButton, 
-        ReplyKeyboardRemove
-    )
-    from aiogram.utils import executor
-    from aiogram.dispatcher import FSMContext
-    from aiogram.dispatcher.filters.state import State, StatesGroup
-    from aiogram.contrib.fsm_storage.memory import MemoryStorage
-except ImportError:
-    os.system("pip install aiogram==2.25.1")
-    from aiogram import Bot, Dispatcher, types
-    from aiogram.contrib.middlewares.logging import LoggingMiddleware
-    from aiogram.types import (
-        InlineKeyboardMarkup, InlineKeyboardButton, 
-        ReplyKeyboardMarkup, KeyboardButton, 
-        ReplyKeyboardRemove
-    )
-    from aiogram.utils import executor
-    from aiogram.dispatcher import FSMContext
-    from aiogram.dispatcher.filters.state import State, StatesGroup
-    from aiogram.contrib.fsm_storage.memory import MemoryStorage
-
-# ===================== КОНФИГУРАЦИЯ =====================
-BOT_TOKEN = "8811262187:AAEssO3CfPRKIXJW1Qh3Nxj-je-yKTBJLnc"
-ADMINS = [1024761707]
-
-# ===================== ИНИЦИАЛИЗАЦИЯ =====================
 logging.basicConfig(level=logging.INFO)
-storage = MemoryStorage()
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot, storage=storage)
-dp.middleware.setup(LoggingMiddleware())
+logger = logging.getLogger(__name__)
 
-# ===================== СОСТОЯНИЯ =====================
-class RegistrationStates(StatesGroup):
-    waiting_for_position = State()
-    waiting_for_experience = State()
-    waiting_for_department = State()
+TOKEN = "8811262187:AAEssO3CfPRKIXJW1Qh3Nxj-je-yKTBJLnc"
+ADMIN_ID = 1024761707  # Без кавычек!
 
-class SurveyStates(StatesGroup):
-    answering = State()
-    waiting_for_test_type = State()
-
-class AdminStates(StatesGroup):
-    waiting_for_broadcast = State()
-    waiting_for_question_add = State()
-    waiting_for_question_edit = State()
-    waiting_for_question_edit_save = State()
-    waiting_for_question_delete = State()
-    waiting_for_admin_add = State()
-    waiting_for_test_add = State()
+# API для погоды (бесплатный OpenWeatherMap)
+WEATHER_API_KEY = ""  # Получить на openweathermap.org (бесплатно)
+DEFAULT_CITY = "Moscow"
 
 # ===================== БАЗА ДАННЫХ =====================
 class Database:
     def __init__(self):
-        self.conn = sqlite3.connect('hr_bot.db', check_same_thread=False)
+        self.conn = sqlite3.connect('tasks.db', check_same_thread=False)
         self.cursor = self.conn.cursor()
         self._create_tables()
-        self._create_indexes()
     
     def _create_tables(self):
-        # Сотрудники (анонимные данные)
+        # Задачи
         self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS employees (
-                user_id INTEGER PRIMARY KEY,
-                position TEXT,
-                department TEXT,
-                experience TEXT,
-                registered_at TEXT
-            )
-        ''')
-        
-        # Администраторы
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS admins (
-                user_id INTEGER PRIMARY KEY,
-                added_at TEXT
-            )
-        ''')
-        
-        # Вопросы по тестам
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS test_questions (
+            CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                test_type TEXT,
-                question_text TEXT,
-                options TEXT,
-                is_active INTEGER DEFAULT 1,
-                created_at TEXT
+                title TEXT,
+                description TEXT,
+                category TEXT DEFAULT 'Работа',
+                priority TEXT DEFAULT 'Средний',
+                due_date TEXT,
+                status TEXT DEFAULT 'active',
+                created_at TEXT,
+                reminder_time TEXT
             )
         ''')
         
-        # Результаты тестов (ОДНА ЗАПИСЬ НА СОТРУДНИКА)
+        # Категории
         self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS test_results (
+            CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                test_type TEXT,
-                position TEXT,
-                department TEXT,
-                experience TEXT,
-                answers_json TEXT,
-                score REAL,
-                level TEXT,
-                date TEXT,
-                hash_id TEXT
+                name TEXT UNIQUE,
+                color TEXT DEFAULT '#007AFF'
             )
         ''')
         
-        # Участники (факт участия)
+        # Напоминания
         self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS test_participants (
-                user_id INTEGER PRIMARY KEY,
-                last_test_date TEXT,
-                test_type TEXT
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER,
+                remind_at TEXT,
+                is_sent INTEGER DEFAULT 0,
+                FOREIGN KEY (task_id) REFERENCES tasks (id)
             )
         ''')
         
-        # Активные тесты
+        # Настройки
         self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS active_tests (
-                user_id INTEGER PRIMARY KEY,
-                test_type TEXT,
-                questions TEXT,
-                current_index INTEGER,
-                answers TEXT
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
             )
         ''')
         self.conn.commit()
-    
-    def _create_indexes(self):
-        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_results_type ON test_results(test_type)')
-        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_results_date ON test_results(date)')
-        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_results_dept ON test_results(department)')
+        
+        # Добавляем категории по умолчанию
+        default_categories = ['Работа', 'Личное', 'Учёба', 'Здоровье', 'Финансы', 'Развлечения']
+        for cat in default_categories:
+            self.cursor.execute('INSERT OR IGNORE INTO categories (name) VALUES (?)', (cat,))
         self.conn.commit()
     
-    # ---- Сотрудники ----
-    def register_employee(self, user_id, position, department, experience):
+    # ---- Задачи ----
+    def add_task(self, title, description="", category="Работа", priority="Средний", due_date=None, reminder_time=None):
         self.cursor.execute('''
-            INSERT OR REPLACE INTO employees (user_id, position, department, experience, registered_at)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (user_id, position, department, experience, datetime.now().isoformat()))
-        self.conn.commit()
-    
-    def is_registered(self, user_id):
-        self.cursor.execute('SELECT user_id FROM employees WHERE user_id = ?', (user_id,))
-        return self.cursor.fetchone() is not None
-    
-    def get_employee(self, user_id):
-        self.cursor.execute('SELECT position, department, experience FROM employees WHERE user_id = ?', (user_id,))
-        return self.cursor.fetchone()
-    
-    def get_all_employees(self):
-        self.cursor.execute('SELECT user_id, position, department, experience FROM employees')
-        return self.cursor.fetchall()
-    
-    # ---- Админы ----
-    def is_admin(self, user_id):
-        self.cursor.execute('SELECT user_id FROM admins WHERE user_id = ?', (user_id,))
-        return self.cursor.fetchone() is not None
-    
-    def add_admin(self, user_id):
-        self.cursor.execute('INSERT OR IGNORE INTO admins (user_id, added_at) VALUES (?, ?)', 
-                           (user_id, datetime.now().isoformat()))
-        self.conn.commit()
-    
-    def remove_admin(self, user_id):
-        self.cursor.execute('DELETE FROM admins WHERE user_id = ?', (user_id,))
-        self.conn.commit()
-    
-    def get_all_admins(self):
-        self.cursor.execute('SELECT user_id FROM admins')
-        return [row[0] for row in self.cursor.fetchall()]
-    
-    # ---- Вопросы ----
-    def add_question(self, test_type, question_text, options):
-        self.cursor.execute('''
-            INSERT INTO test_questions (test_type, question_text, options, created_at)
-            VALUES (?, ?, ?, ?)
-        ''', (test_type, question_text, json.dumps(options), datetime.now().isoformat()))
+            INSERT INTO tasks (title, description, category, priority, due_date, created_at, reminder_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (title, description, category, priority, due_date, datetime.now().isoformat(), reminder_time))
         self.conn.commit()
         return self.cursor.lastrowid
     
-    def get_questions_by_type(self, test_type):
-        self.cursor.execute('SELECT * FROM test_questions WHERE test_type = ? AND is_active = 1 ORDER BY RANDOM()', (test_type,))
+    def get_tasks(self, status="active"):
+        self.cursor.execute('''
+            SELECT id, title, description, category, priority, due_date, reminder_time
+            FROM tasks WHERE status = ? ORDER BY due_date, priority DESC
+        ''', (status,))
         return self.cursor.fetchall()
     
-    def get_all_questions(self):
-        self.cursor.execute('SELECT * FROM test_questions WHERE is_active = 1 ORDER BY test_type, id')
+    def get_tasks_by_category(self, category, status="active"):
+        self.cursor.execute('''
+            SELECT id, title, description, priority, due_date
+            FROM tasks WHERE category = ? AND status = ?
+            ORDER BY due_date
+        ''', (category, status))
         return self.cursor.fetchall()
     
-    def get_question_by_id(self, question_id):
-        self.cursor.execute('SELECT * FROM test_questions WHERE id = ? AND is_active = 1', (question_id,))
+    def get_task_by_id(self, task_id):
+        self.cursor.execute('SELECT * FROM tasks WHERE id = ?', (task_id,))
         return self.cursor.fetchone()
     
-    def update_question(self, question_id, question_text, options):
-        self.cursor.execute('UPDATE test_questions SET question_text = ?, options = ? WHERE id = ?', 
-                           (question_text, json.dumps(options), question_id))
+    def update_task_status(self, task_id, status):
+        self.cursor.execute('UPDATE tasks SET status = ? WHERE id = ?', (status, task_id))
         self.conn.commit()
     
-    def delete_question(self, question_id):
-        self.cursor.execute('UPDATE test_questions SET is_active = 0 WHERE id = ?', (question_id,))
+    def delete_task(self, task_id):
+        self.cursor.execute('DELETE FROM tasks WHERE id = ?', (task_id,))
         self.conn.commit()
     
-    def count_questions_by_type(self, test_type):
-        self.cursor.execute('SELECT COUNT(*) FROM test_questions WHERE test_type = ? AND is_active = 1', (test_type,))
-        return self.cursor.fetchone()[0]
-    
-    def get_test_types(self):
-        self.cursor.execute('SELECT DISTINCT test_type FROM test_questions WHERE is_active = 1')
+    def get_categories(self):
+        self.cursor.execute('SELECT name FROM categories ORDER BY name')
         return [row[0] for row in self.cursor.fetchall()]
     
-    # ---- Результаты тестов ----
-    def save_test_result(self, test_type, position, department, experience, answers_dict, score, level):
-        hash_id = hashlib.md5(f"{position}{department}{experience}{datetime.now().timestamp()}".encode()).hexdigest()[:8]
+    def get_stats(self):
+        self.cursor.execute('SELECT COUNT(*) FROM tasks WHERE status = "active"')
+        active = self.cursor.fetchone()[0]
+        
+        self.cursor.execute('SELECT COUNT(*) FROM tasks WHERE status = "completed"')
+        completed = self.cursor.fetchone()[0]
         
         self.cursor.execute('''
-            INSERT INTO test_results (test_type, position, department, experience, answers_json, score, level, date, hash_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (test_type, position, department, experience, json.dumps(answers_dict), score, level, datetime.now().isoformat(), hash_id))
-        self.conn.commit()
-        return self.cursor.lastrowid
-    
-    def mark_participant(self, user_id, test_type):
-        self.cursor.execute('''
-            INSERT OR REPLACE INTO test_participants (user_id, last_test_date, test_type)
-            VALUES (?, ?, ?)
-        ''', (user_id, datetime.now().isoformat(), test_type))
-        self.conn.commit()
-    
-    def has_participated(self, user_id, test_type=None):
-        if test_type:
-            self.cursor.execute('SELECT user_id FROM test_participants WHERE user_id = ? AND test_type = ?', (user_id, test_type))
-        else:
-            self.cursor.execute('SELECT user_id FROM test_participants WHERE user_id = ?', (user_id,))
-        return self.cursor.fetchone() is not None
-    
-    def get_test_stats(self, test_type=None):
-        """Полная статистика для админа"""
-        if test_type:
-            where = f"WHERE test_type = '{test_type}'"
-        else:
-            where = ""
-        
-        # Общая статистика
-        self.cursor.execute(f'''
-            SELECT 
-                COUNT(*) as total_participants,
-                AVG(score) as avg_score,
-                MIN(score) as min_score,
-                MAX(score) as max_score,
-                COUNT(DISTINCT department) as dept_count,
-                COUNT(DISTINCT position) as pos_count
-            FROM test_results
-            {where}
+            SELECT category, COUNT(*) FROM tasks WHERE status = "active" 
+            GROUP BY category ORDER BY COUNT(*) DESC
         ''')
-        general = self.cursor.fetchone()
+        by_category = self.cursor.fetchall()
         
-        # Уровни
-        self.cursor.execute(f'''
-            SELECT level, COUNT(*) as count, AVG(score) as avg_score
-            FROM test_results
-            {where}
-            GROUP BY level
-            ORDER BY avg_score DESC
-        ''')
-        levels = self.cursor.fetchall()
-        
-        # По отделам
-        self.cursor.execute(f'''
-            SELECT department, COUNT(*) as count, AVG(score) as avg_score
-            FROM test_results
-            {where}
-            GROUP BY department
-            ORDER BY avg_score DESC
-        ''')
-        by_department = self.cursor.fetchall()
-        
-        # По должностям
-        self.cursor.execute(f'''
-            SELECT position, COUNT(*) as count, AVG(score) as avg_score
-            FROM test_results
-            {where}
-            GROUP BY position
-            ORDER BY avg_score DESC
-            LIMIT 15
-        ''')
-        by_position = self.cursor.fetchall()
-        
-        # По стажу
-        self.cursor.execute(f'''
-            SELECT experience, COUNT(*) as count, AVG(score) as avg_score
-            FROM test_results
-            {where}
-            GROUP BY experience
-            ORDER BY experience
-        ''')
-        by_experience = self.cursor.fetchall()
-        
-        # TOP сотрудников (анонимно)
-        self.cursor.execute(f'''
-            SELECT position, department, experience, score, level, date
-            FROM test_results
-            {where}
-            ORDER BY score DESC
-            LIMIT 10
-        ''')
-        top = self.cursor.fetchall()
-        
-        return general, levels, by_department, by_position, by_experience, top
-    
-    # ---- Активные тесты ----
-    def save_active_test(self, user_id, test_type, question_ids, current_index, answers):
-        self.cursor.execute('''
-            INSERT OR REPLACE INTO active_tests (user_id, test_type, questions, current_index, answers)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (user_id, test_type, json.dumps(question_ids), current_index, json.dumps(answers)))
-        self.conn.commit()
-    
-    def get_active_test(self, user_id):
-        self.cursor.execute('SELECT test_type, questions, current_index, answers FROM active_tests WHERE user_id = ?', (user_id,))
-        result = self.cursor.fetchone()
-        if result:
-            return result[0], json.loads(result[1]), result[2], json.loads(result[3])
-        return None, None, 0, None
-    
-    def clear_active_test(self, user_id):
-        self.cursor.execute('DELETE FROM active_tests WHERE user_id = ?', (user_id,))
-        self.conn.commit()
+        return active, completed, by_category
 
-# ===================== БАЗА ДАННЫХ =====================
 db = Database()
 
-# ===================== ТЕСТЫ =====================
-def init_tests():
-    """Инициализация тестов"""
-    test_types = ['Лояльность', 'Выгорание', 'Вовлеченность', 'Стресс']
-    
-    for test_type in test_types:
-        if db.count_questions_by_type(test_type) > 0:
-            continue
-    
-    questions = {
-        'Лояльность': [
-            ("Насколько вы удовлетворены своей работой?", ["1 - Совсем нет", "5 - Частично", "10 - Полностью"]),
-            ("Как вы оцениваете руководство?", ["1 - Плохо", "5 - Нормально", "10 - Отлично"]),
-            ("Гордитесь ли вы работой в компании?", ["1 - Нет", "5 - Иногда", "10 - Да"]),
-            ("Рекомендуете ли вы компанию друзьям?", ["1 - Нет", "5 - Возможно", "10 - Да"]),
-            ("Как вы оцениваете атмосферу в коллективе?", ["1 - Плохая", "5 - Нормальная", "10 - Отличная"]),
-        ],
-        'Выгорание': [
-            ("Чувствуете ли вы эмоциональное истощение?", ["1 - Никогда", "5 - Иногда", "10 - Постоянно"]),
-            ("Потеряли ли вы интерес к работе?", ["1 - Нет", "5 - Частично", "10 - Да"]),
-            ("Чувствуете ли вы цинизм к работе?", ["1 - Нет", "5 - Иногда", "10 - Да"]),
-            ("Чувствуете ли вы снижение продуктивности?", ["1 - Нет", "5 - Иногда", "10 - Да"]),
-            ("Чувствуете ли вы перегрузку?", ["1 - Нет", "5 - Иногда", "10 - Постоянно"]),
-        ],
-        'Вовлеченность': [
-            ("Насколько вы вовлечены в работу?", ["1 - Совсем нет", "5 - Частично", "10 - Полностью"]),
-            ("Готовы ли вы работать сверхурочно?", ["1 - Нет", "5 - Иногда", "10 - Да"]),
-            ("Участвуете ли вы в жизни компании?", ["1 - Нет", "5 - Иногда", "10 - Активно"]),
-            ("Вносите ли вы идеи по улучшению?", ["1 - Никогда", "5 - Иногда", "10 - Постоянно"]),
-            ("Чувствуете ли вы связь с целями компании?", ["1 - Нет", "5 - Частично", "10 - Да"]),
-        ],
-        'Стресс': [
-            ("Как часто вы испытываете стресс на работе?", ["1 - Никогда", "5 - Иногда", "10 - Постоянно"]),
-            ("Влияет ли стресс на качество работы?", ["1 - Нет", "5 - Частично", "10 - Сильно"]),
-            ("Чувствуете ли вы напряжение в коллективе?", ["1 - Нет", "5 - Иногда", "10 - Постоянно"]),
-            ("Можете ли вы расслабиться после работы?", ["1 - Нет", "5 - Иногда", "10 - Да"]),
-            ("Чувствуете ли вы поддержку руководства?", ["1 - Нет", "5 - Иногда", "10 - Да"]),
-        ]
-    }
-    
-    for test_type, q_list in questions.items():
-        for q_text, options in q_list:
-            db.add_question(test_type, q_text, options)
-    
-    logging.info(f"✅ Добавлены тесты: {', '.join(test_types)}")
-
 # ===================== КЛАВИАТУРЫ =====================
-def get_main_keyboard(user_id):
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    keyboard.add(
-        KeyboardButton("📝 Пройти тест"),
-        KeyboardButton("📊 Моя статистика")
-    )
-    keyboard.add(
-        KeyboardButton("🏆 Топ HR"),
-        KeyboardButton("ℹ️ Помощь")
-    )
-    
-    if db.is_admin(user_id):
-        keyboard.add(KeyboardButton("⚙️ Админ-панель"))
-    
-    return keyboard
+def main_menu():
+    keyboard = [
+        [InlineKeyboardButton("📋 Мои дела", callback_data='list_tasks')],
+        [InlineKeyboardButton("➕ Добавить дело", callback_data='add_task_start')],
+        [InlineKeyboardButton("📊 Статистика", callback_data='stats')],
+        [InlineKeyboardButton("🗂 Категории", callback_data='categories')],
+        [InlineKeyboardButton("🌤 Погода", callback_data='weather')],
+        [InlineKeyboardButton("📅 Календарь", callback_data='calendar')],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data='settings')],
+        [InlineKeyboardButton("❓ Помощь", callback_data='help')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-def get_admin_keyboard():
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    keyboard.add(
-        KeyboardButton("📢 Рассылка"),
-        KeyboardButton("➕ Добавить вопрос")
-    )
-    keyboard.add(
-        KeyboardButton("✏️ Редактировать вопрос"),
-        KeyboardButton("❌ Удалить вопрос")
-    )
-    keyboard.add(
-        KeyboardButton("📊 Статистика"),
-        KeyboardButton("👑 Назначить админа")
-    )
-    keyboard.add(
-        KeyboardButton("🗑 Очистить БД"),
-        KeyboardButton("🔙 Главное меню")
-    )
-    return keyboard
+def task_actions_keyboard(task_id):
+    keyboard = [
+        [InlineKeyboardButton("✅ Выполнено", callback_data=f'done_{task_id}')],
+        [InlineKeyboardButton("🗑 Удалить", callback_data=f'delete_{task_id}')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='back_to_list')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-def get_test_type_keyboard():
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("❤️ Лояльность", callback_data="test_Лояльность"),
-        InlineKeyboardButton("🔥 Выгорание", callback_data="test_Выгорание")
-    )
-    keyboard.add(
-        InlineKeyboardButton("🚀 Вовлеченность", callback_data="test_Вовлеченность"),
-        InlineKeyboardButton("😰 Стресс", callback_data="test_Стресс")
-    )
-    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu"))
-    return keyboard
+def categories_keyboard():
+    categories = db.get_categories()
+    keyboard = []
+    for cat in categories:
+        keyboard.append([InlineKeyboardButton(f"📂 {cat}", callback_data=f'cat_{cat}')])
+    keyboard.append([InlineKeyboardButton("➕ Добавить категорию", callback_data='add_category')])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')])
+    return InlineKeyboardMarkup(keyboard)
 
-def get_rating_keyboard(question_id, options):
-    keyboard = InlineKeyboardMarkup(row_width=3)
-    buttons = []
-    for i, option in enumerate(options):
-        emoji = "🔴" if i == 0 else "🟡" if i == 1 else "🟢"
-        buttons.append(InlineKeyboardButton(f"{emoji} {option[:15]}", callback_data=f"rate_{i}_{question_id}"))
+def priority_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("🔴 Высокий", callback_data='priority_high')],
+        [InlineKeyboardButton("🟡 Средний", callback_data='priority_medium')],
+        [InlineKeyboardButton("🟢 Низкий", callback_data='priority_low')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def calendar_keyboard(year, month):
+    keyboard = []
+    # Заголовок с месяцем
+    month_names = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+                   'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь']
+    keyboard.append([InlineKeyboardButton(f"📅 {month_names[month-1]} {year}", callback_data='noop')])
     
-    for i in range(0, len(buttons), 3):
-        keyboard.add(*buttons[i:i+3])
+    # Дни недели
+    keyboard.append([
+        InlineKeyboardButton("Пн", callback_data='noop'),
+        InlineKeyboardButton("Вт", callback_data='noop'),
+        InlineKeyboardButton("Ср", callback_data='noop'),
+        InlineKeyboardButton("Чт", callback_data='noop'),
+        InlineKeyboardButton("Пт", callback_data='noop'),
+        InlineKeyboardButton("Сб", callback_data='noop'),
+        InlineKeyboardButton("Вс", callback_data='noop')
+    ])
     
-    return keyboard
+    # Дни месяца
+    import calendar
+    cal = calendar.monthcalendar(year, month)
+    for week in cal:
+        row = []
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(" ", callback_data='noop'))
+            else:
+                date_str = f"{year}-{month:02d}-{day:02d}"
+                row.append(InlineKeyboardButton(str(day), callback_data=f'date_{date_str}'))
+        keyboard.append(row)
+    
+    # Навигация
+    prev_month = month - 1 if month > 1 else 12
+    prev_year = year if month > 1 else year - 1
+    next_month = month + 1 if month < 12 else 1
+    next_year = year if month < 12 else year + 1
+    
+    keyboard.append([
+        InlineKeyboardButton("◀️", callback_data=f'calendar_{prev_year}_{prev_month}'),
+        InlineKeyboardButton("Сегодня", callback_data='calendar_today'),
+        InlineKeyboardButton("▶️", callback_data=f'calendar_{next_year}_{next_month}')
+    ])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+# ===================== ПОГОДА =====================
+def get_weather(city=DEFAULT_CITY):
+    if not WEATHER_API_KEY:
+        return "🌤 API ключ не настроен. Получите бесплатный ключ на openweathermap.org"
+    
+    try:
+        url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={WEATHER_API_KEY}&units=metric&lang=ru"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        
+        if data.get('cod') != 200:
+            return f"❌ Город не найден: {city}"
+        
+        temp = data['main']['temp']
+        feels_like = data['main']['feels_like']
+        humidity = data['main']['humidity']
+        description = data['weather'][0]['description']
+        wind = data['wind']['speed']
+        
+        text = f"🌤 *Погода в {city}*\n\n"
+        text += f"🌡 Температура: {temp:.1f}°C (ощущается {feels_like:.1f}°C)\n"
+        text += f"💧 Влажность: {humidity}%\n"
+        text += f"🌬 Ветер: {wind} м/с\n"
+        text += f"📝 {description.capitalize()}"
+        
+        return text
+    except Exception as e:
+        return f"❌ Ошибка получения погоды: {str(e)}"
 
 # ===================== ОБРАБОТЧИКИ =====================
-@dp.message_handler(commands=['start'])
-async def start_command(message: types.Message):
-    user_id = message.from_user.id
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("⛔ Доступ запрещен.")
+        return
     
-    if not db.is_registered(user_id):
-        await message.answer(
-            "🌟 *Добро пожаловать в HR Pulse!*\n\n"
-            "Здесь вы можете пройти анонимные тесты:\n"
-            "❤️ Лояльность\n"
-            "🔥 Выгорание\n"
-            "🚀 Вовлеченность\n"
-            "😰 Стресс\n\n"
-            "📌 *Важно:*\n"
-            "✅ Все ответы полностью анонимны\n"
-            "✅ Данные видны только HR\n"
-            "✅ Тесты занимают 2-3 минуты\n\n"
-            "Для начала укажите вашу *должность*:",
-            parse_mode="Markdown"
+    await update.message.reply_text(
+        "🤖 *Планировщик задач*\n\n"
+        "📋 *Что я умею:*\n"
+        "• Создавать задачи с категориями и приоритетами\n"
+        "• Устанавливать сроки и напоминания\n"
+        "• Показывать погоду\n"
+        "• Вести статистику задач\n"
+        "• Работать с календарём\n\n"
+        "Выберите действие:",
+        reply_markup=main_menu(),
+        parse_mode='Markdown'
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await query.edit_message_text("⛔ Доступ запрещен.")
+        return
+    
+    data = query.data
+    
+    # ----- Главное меню -----
+    if data == 'back_to_menu':
+        await query.edit_message_text(
+            "🤖 *Планировщик задач*\n\nВыберите действие:",
+            reply_markup=main_menu(),
+            parse_mode='Markdown'
         )
-        await RegistrationStates.waiting_for_position.set()
-    else:
-        await message.answer(
-            "👋 *С возвращением!*\n\n"
+    
+    # ----- Список задач -----
+    elif data == 'list_tasks':
+        tasks = db.get_tasks()
+        if not tasks:
+            await query.edit_message_text(
+                "📭 *Нет активных задач*\n\n"
+                "Нажмите '➕ Добавить дело' чтобы создать задачу.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ Добавить дело", callback_data='add_task_start')],
+                    [InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')]
+                ]),
+                parse_mode='Markdown'
+            )
+            return
+        
+        text = "📋 *Ваши задачи:*\n\n"
+        for task in tasks:
+            task_id, title, desc, category, priority, due_date, reminder = task
+            priority_emoji = {"Высокий": "🔴", "Средний": "🟡", "Низкий": "🟢"}.get(priority, "🟡")
+            due = f" (до {due_date})" if due_date else ""
+            text += f"{priority_emoji} *{title}*{due}\n"
+            text += f"   📂 {category}\n"
+            if desc:
+                text += f"   📝 {desc[:50]}\n"
+            text += "\n"
+        
+        text += "\n_Выберите задачу для управления или нажмите кнопку ниже:_"
+        
+        # Кнопки для каждой задачи
+        keyboard = []
+        for task in tasks[:10]:  # Показываем первые 10
+            task_id = task[0]
+            keyboard.append([InlineKeyboardButton(f"• {task[1][:30]}", callback_data=f'task_{task_id}')])
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')])
+        
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    
+    # ----- Просмотр задачи -----
+    elif data.startswith('task_'):
+        task_id = int(data.split('_')[1])
+        task = db.get_task_by_id(task_id)
+        if not task:
+            await query.edit_message_text("❌ Задача не найдена.", reply_markup=main_menu())
+            return
+        
+        text = f"📌 *{task[1]}*\n\n"
+        text += f"📂 Категория: {task[3]}\n"
+        text += f"🔵 Приоритет: {task[4]}\n"
+        if task[5]:
+            text += f"📅 Срок: {task[5]}\n"
+        if task[6]:
+            text += f"⏰ Напоминание: {task[6]}\n"
+        if task[2]:
+            text += f"📝 {task[2]}\n"
+        text += f"📌 Статус: {'✅ Выполнено' if task[7] == 'completed' else '🔄 В процессе'}"
+        
+        await query.edit_message_text(text, reply_markup=task_actions_keyboard(task_id), parse_mode='Markdown')
+    
+    # ----- Действия с задачей -----
+    elif data.startswith('done_'):
+        task_id = int(data.split('_')[1])
+        db.update_task_status(task_id, 'completed')
+        await query.edit_message_text(
+            "✅ Задача выполнена! Отлично! 🎉",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')]])
+        )
+    
+    elif data.startswith('delete_'):
+        task_id = int(data.split('_')[1])
+        db.delete_task(task_id)
+        await query.edit_message_text(
+            "🗑 Задача удалена.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')]])
+        )
+    
+    elif data == 'back_to_list':
+        await button_handler(update, context)  # Перезапускаем список
+    
+    # ----- Добавление задачи -----
+    elif data == 'add_task_start':
+        await query.edit_message_text(
+            "✏️ *Добавление задачи*\n\n"
+            "Введите название задачи:",
+            parse_mode='Markdown'
+        )
+        context.user_data['step'] = 'add_task_title'
+    
+    # ----- Категории -----
+    elif data == 'categories':
+        await query.edit_message_text(
+            "📂 *Категории задач*\n\n"
+            "Выберите категорию чтобы посмотреть задачи:",
+            reply_markup=categories_keyboard(),
+            parse_mode='Markdown'
+        )
+    
+    elif data.startswith('cat_'):
+        category = data.replace('cat_', '')
+        tasks = db.get_tasks_by_category(category)
+        if not tasks:
+            await query.edit_message_text(
+                f"📭 В категории '{category}' нет задач.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад", callback_data='categories')],
+                    [InlineKeyboardButton("🔙 В меню", callback_data='back_to_menu')]
+                ])
+            )
+            return
+        
+        text = f"📂 *{category}*\n\n"
+        for task in tasks:
+            task_id, title, desc, priority, due_date = task
+            priority_emoji = {"Высокий": "🔴", "Средний": "🟡", "Низкий": "🟢"}.get(priority, "🟡")
+            due = f" (до {due_date})" if due_date else ""
+            text += f"{priority_emoji} {title}{due}\n"
+        
+        text += "\n_Выберите задачу:_"
+        keyboard = []
+        for task in tasks[:10]:
+            keyboard.append([InlineKeyboardButton(f"• {task[1][:30]}", callback_data=f'task_{task[0]}')])
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='categories')])
+        
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    
+    elif data == 'add_category':
+        await query.edit_message_text(
+            "✏️ Введите название новой категории:",
+            parse_mode='Markdown'
+        )
+        context.user_data['step'] = 'add_category'
+    
+    # ----- Статистика -----
+    elif data == 'stats':
+        active, completed, by_category = db.get_stats()
+        
+        text = "📊 *Статистика задач*\n\n"
+        text += f"🔄 Активных: {active}\n"
+        text += f"✅ Выполнено: {completed}\n"
+        text += f"📊 Всего: {active + completed}\n\n"
+        
+        if by_category:
+            text += "*По категориям:*\n"
+            for cat, count in by_category:
+                text += f"📂 {cat}: {count} задач\n"
+        else:
+            text += "Нет задач в категориях"
+        
+        await query.edit_message_text(text, reply_markup=main_menu(), parse_mode='Markdown')
+    
+    # ----- Погода -----
+    elif data == 'weather':
+        weather_text = get_weather()
+        await query.edit_message_text(
+            weather_text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Обновить", callback_data='weather')],
+                [InlineKeyboardButton("🌍 Другой город", callback_data='change_city')],
+                [InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')]
+            ]),
+            parse_mode='Markdown'
+        )
+    
+    elif data == 'change_city':
+        await query.edit_message_text(
+            "🌍 *Смена города*\n\n"
+            "Введите название города:",
+            parse_mode='Markdown'
+        )
+        context.user_data['step'] = 'change_city'
+    
+    # ----- Календарь -----
+    elif data.startswith('calendar'):
+        if data == 'calendar_today':
+            now = datetime.now()
+            await show_calendar(query, now.year, now.month)
+        elif data == 'calendar':
+            now = datetime.now()
+            await show_calendar(query, now.year, now.month)
+        elif data.startswith('calendar_'):
+            parts = data.split('_')
+            year = int(parts[1])
+            month = int(parts[2])
+            await show_calendar(query, year, month)
+    
+    elif data.startswith('date_'):
+        date_str = data.replace('date_', '')
+        context.user_data['selected_date'] = date_str
+        
+        # Показываем задачи на эту дату
+        tasks = db.get_tasks()
+        tasks_on_date = [t for t in tasks if t[5] == date_str]
+        
+        if tasks_on_date:
+            text = f"📅 *Задачи на {date_str}:*\n\n"
+            for task in tasks_on_date:
+                text += f"• {task[1]}\n"
+        else:
+            text = f"📅 Нет задач на {date_str}"
+        
+        keyboard = [
+            [InlineKeyboardButton("➕ Добавить на эту дату", callback_data=f'add_date_{date_str}')],
+            [InlineKeyboardButton("🔙 Назад", callback_data='calendar')]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    
+    elif data.startswith('add_date_'):
+        date_str = data.replace('add_date_', '')
+        context.user_data['selected_date'] = date_str
+        await query.edit_message_text(
+            f"✏️ Введите название задачи на {date_str}:",
+            parse_mode='Markdown'
+        )
+        context.user_data['step'] = 'add_task_date'
+    
+    # ----- Настройки -----
+    elif data == 'settings':
+        keyboard = [
+            [InlineKeyboardButton("🌤 Город для погоды", callback_data='change_city')],
+            [InlineKeyboardButton("🗑 Очистить все задачи", callback_data='clear_all')],
+            [InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')]
+        ]
+        await query.edit_message_text(
+            "⚙️ *Настройки*\n\n"
             "Выберите действие:",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard(user_id)
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
         )
-
-# ===================== РЕГИСТРАЦИЯ =====================
-@dp.message_handler(state=RegistrationStates.waiting_for_position)
-async def process_position(message: types.Message, state: FSMContext):
-    await state.update_data(position=message.text)
-    await message.answer("🏢 Введите ваш *отдел*:", parse_mode="Markdown")
-    await RegistrationStates.waiting_for_department.set()
-
-@dp.message_handler(state=RegistrationStates.waiting_for_department)
-async def process_department(message: types.Message, state: FSMContext):
-    await state.update_data(department=message.text)
-    await message.answer(
-        "📅 *Стаж работы в компании:*",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardMarkup(resize_keyboard=True, row_width=2).add(
-            KeyboardButton("Менее 3 месяцев"),
-            KeyboardButton("3-6 месяцев"),
-            KeyboardButton("6-12 месяцев"),
-            KeyboardButton("1-2 года"),
-            KeyboardButton("2-5 лет"),
-            KeyboardButton("Более 5 лет")
+    
+    elif data == 'clear_all':
+        keyboard = [
+            [InlineKeyboardButton("✅ Да, удалить всё", callback_data='confirm_clear')],
+            [InlineKeyboardButton("❌ Нет, отмена", callback_data='settings')]
+        ]
+        await query.edit_message_text(
+            "⚠️ *ВНИМАНИЕ!*\n\n"
+            "Вы уверены, что хотите удалить ВСЕ задачи?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
         )
-    )
-    await RegistrationStates.waiting_for_experience.set()
+    
+    elif data == 'confirm_clear':
+        db.cursor.execute('DELETE FROM tasks')
+        db.conn.commit()
+        await query.edit_message_text(
+            "🗑 Все задачи удалены.",
+            reply_markup=main_menu()
+        )
+    
+    # ----- Помощь -----
+    elif data == 'help':
+        text = "❓ *Помощь*\n\n"
+        text += "🤖 *Что я умею:*\n"
+        text += "📋 *Мои дела* — список всех активных задач\n"
+        text += "➕ *Добавить дело* — создать новую задачу\n"
+        text += "📊 *Статистика* — общая статистика задач\n"
+        text += "🗂 *Категории* — задачи по категориям\n"
+        text += "🌤 *Погода* — погода в вашем городе\n"
+        text += "📅 *Календарь* — просмотр задач по датам\n\n"
+        text += "📝 *Как добавить задачу:*\n"
+        text += "1. Нажмите '➕ Добавить дело'\n"
+        text += "2. Введите название\n"
+        text += "3. Выберите категорию\n"
+        text += "4. Выберите приоритет\n"
+        text += "5. Укажите срок (опционально)\n\n"
+        text += "🔐 Бот доступен только администратору."
+        
+        await query.edit_message_text(text, reply_markup=main_menu(), parse_mode='Markdown')
+    
+    elif data == 'noop':
+        pass
 
-@dp.message_handler(state=RegistrationStates.waiting_for_experience)
-async def process_experience(message: types.Message, state: FSMContext):
-    experience = message.text
-    valid_options = ["Менее 3 месяцев", "3-6 месяцев", "6-12 месяцев", "1-2 года", "2-5 лет", "Более 5 лет"]
-    
-    if experience not in valid_options:
-        await message.answer("❌ Пожалуйста, выберите вариант из списка:")
-        return
-    
-    data = await state.get_data()
-    
-    db.register_employee(
-        message.from_user.id,
-        data.get('position'),
-        data.get('department'),
-        experience
-    )
-    
-    await state.finish()
-    await message.answer(
-        f"✅ *Регистрация завершена!*\n\n"
-        f"📊 Должность: {data.get('position')}\n"
-        f"🏢 Отдел: {data.get('department')}\n"
-        f"📅 Стаж: {experience}\n\n"
-        "Все данные анонимны! 🕵️\n"
-        "Теперь вы можете пройти тесты.",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard(message.from_user.id)
+async def show_calendar(query, year, month):
+    await query.edit_message_text(
+        "📅 *Календарь*\n\nВыберите дату:",
+        reply_markup=calendar_keyboard(year, month),
+        parse_mode='Markdown'
     )
 
-# ===================== ГЛАВНОЕ МЕНЮ =====================
-@dp.message_handler(lambda message: message.text in ["📝 Пройти тест", "📊 Моя статистика", "🏆 Топ HR", "ℹ️ Помощь", "⚙️ Админ-панель"])
-async def handle_menu(message: types.Message):
-    user_id = message.from_user.id
+# ===================== ОБРАБОТКА СООБЩЕНИЙ =====================
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("⛔ Доступ запрещен.")
+        return
     
-    if message.text == "📝 Пройти тест":
-        await message.answer(
-            "📝 *Выберите тип теста:*",
-            parse_mode="Markdown",
-            reply_markup=get_test_type_keyboard()
+    text = update.message.text
+    step = context.user_data.get('step')
+    
+    # ---- Добавление задачи (шаг 1: название) ----
+    if step == 'add_task_title':
+        context.user_data['task_title'] = text
+        
+        # Показываем категории
+        categories = db.get_categories()
+        keyboard = []
+        for cat in categories:
+            keyboard.append([InlineKeyboardButton(f"📂 {cat}", callback_data=f'set_cat_{cat}')])
+        keyboard.append([InlineKeyboardButton("➕ Новая категория", callback_data='add_category')])
+        keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data='back_to_menu')])
+        
+        await update.message.reply_text(
+            f"✏️ *{text}*\n\nВыберите категорию:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        context.user_data['step'] = 'add_task_category'
+    
+    # ---- Добавление задачи (шаг 2: категория через callback) ----
+    # Обрабатывается в button_handler
+    
+    # ---- Добавление задачи (шаг 3: приоритет) ----
+    elif step == 'add_task_priority':
+        # Сохраняем приоритет из callback
+        pass
+    
+    # ---- Добавление категории ----
+    elif step == 'add_category':
+        db.cursor.execute('INSERT OR IGNORE INTO categories (name) VALUES (?)', (text,))
+        db.conn.commit()
+        context.user_data['step'] = None
+        await update.message.reply_text(
+            f"✅ Категория '{text}' добавлена!",
+            reply_markup=main_menu()
         )
     
-    elif message.text == "📊 Моя статистика":
-        await show_user_stats(message, user_id)
-    
-    elif message.text == "🏆 Топ HR":
-        await show_top_hr(message)
-    
-    elif message.text == "ℹ️ Помощь":
-        await message.answer(
-            "ℹ️ *Помощь*\n\n"
-            "📝 *Пройти тест* - анонимные тесты:\n"
-            "   ❤️ Лояльность\n"
-            "   🔥 Выгорание\n"
-            "   🚀 Вовлеченность\n"
-            "   😰 Стресс\n\n"
-            "📊 *Моя статистика* - ваши результаты\n"
-            "🏆 *Топ HR* - лучшие сотрудники (анонимно)\n"
-            "⚙️ *Админ-панель* - управление (только для HR)",
-            parse_mode="Markdown"
+    # ---- Смена города ----
+    elif step == 'change_city':
+        context.user_data['step'] = None
+        # Сохраняем город в настройках
+        db.cursor.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ('city', text))
+        db.conn.commit()
+        await update.message.reply_text(
+            f"🌍 Город изменён на {text}",
+            reply_markup=main_menu()
         )
     
-    elif message.text == "⚙️ Админ-панель":
-        if db.is_admin(user_id):
-            await message.answer(
-                "⚙️ *Панель администратора*\n\n"
-                "Управление анонимными тестами:",
-                parse_mode="Markdown",
-                reply_markup=get_admin_keyboard()
-            )
-        else:
-            await message.answer("⛔ У вас нет прав администратора.")
-
-# ===================== ТЕСТЫ =====================
-@dp.callback_query_handler(lambda c: c.data.startswith('test_'))
-async def start_test(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    test_type = callback_query.data.replace('test_', '')
-    
-    await callback_query.answer()
-    
-    if not db.is_registered(user_id):
-        await callback_query.message.answer("❌ Сначала зарегистрируйтесь через /start")
-        return
-    
-    if db.count_questions_by_type(test_type) == 0:
-        await callback_query.message.answer(f"❌ Вопросы для теста '{test_type}' не найдены.")
-        return
-    
-    if db.has_participated(user_id, test_type):
-        keyboard = InlineKeyboardMarkup()
-        keyboard.add(
-            InlineKeyboardButton("🔄 Пройти заново", callback_data=f"restart_test_{test_type}"),
-            InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")
-        )
-        await callback_query.message.answer(
-            f"⚠️ *Вы уже проходили тест '{test_type}'*\n\n"
-            "Хотите пройти заново?",
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-        return
-    
-    # Проверяем незавершенный тест
-    active_type, questions, current_index, answers = db.get_active_test(user_id)
-    
-    if active_type and current_index > 0 and current_index < len(questions):
-        keyboard = InlineKeyboardMarkup()
-        keyboard.add(
-            InlineKeyboardButton("✅ Продолжить", callback_data="continue_test"),
-            InlineKeyboardButton("🔄 Начать заново", callback_data=f"restart_test_{test_type}"),
-            InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")
-        )
-        await callback_query.message.answer("⏳ У вас есть незавершенный тест.", reply_markup=keyboard)
-        return
-    
-    # Начинаем новый тест
-    all_questions = db.get_questions_by_type(test_type)
-    question_ids = [q[0] for q in all_questions]
-    
-    await callback_query.message.answer(
-        f"📝 *Тест: {test_type}*\n\n"
-        f"Всего вопросов: {len(question_ids)}\n"
-        "Оцените каждый вопрос по шкале.\n\n"
-        "Все ответы анонимны! 🕵️",
-        parse_mode="Markdown"
-    )
-    
-    db.save_active_test(user_id, test_type, question_ids, 0, {})
-    await send_test_question(callback_query.message, user_id, 0)
-
-@dp.callback_query_handler(lambda c: c.data == 'continue_test')
-async def continue_test(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    test_type, questions, current_index, answers = db.get_active_test(user_id)
-    
-    await callback_query.answer()
-    await callback_query.message.delete()
-    await send_test_question(callback_query.message, user_id, current_index)
-
-@dp.callback_query_handler(lambda c: c.data.startswith('restart_test_'))
-async def restart_test(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    test_type = callback_query.data.replace('restart_test_', '')
-    
-    db.clear_active_test(user_id)
-    await callback_query.answer()
-    await callback_query.message.delete()
-    
-    # Удаляем старую запись участника
-    db.cursor.execute('DELETE FROM test_participants WHERE user_id = ? AND test_type = ?', (user_id, test_type))
-    db.conn.commit()
-    
-    await start_test(callback_query)
-
-@dp.callback_query_handler(lambda c: c.data == 'back_to_menu')
-async def back_to_menu_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    await callback_query.answer()
-    await callback_query.message.delete()
-    await callback_query.message.answer(
-        "🔙 Главное меню",
-        reply_markup=get_main_keyboard(user_id)
-    )
-
-async def send_test_question(message: types.Message, user_id, index):
-    test_type, questions, current_index, answers = db.get_active_test(user_id)
-    
-    if not questions or index >= len(questions):
-        await finish_test(message, user_id)
-        return
-    
-    question_id = questions[index]
-    question = db.get_question_by_id(question_id)
-    
-    if not question:
-        await message.answer("❌ Ошибка загрузки вопроса.")
-        return
-    
-    options = json.loads(question[3])
-    
-    text = f"📝 *Вопрос {index + 1} из {len(questions)}*\n\n"
-    text += f"*{question[2]}*\n\n"
-    text += "Выберите вариант:"
-    
-    keyboard = get_rating_keyboard(question_id, options)
-    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
-
-@dp.callback_query_handler(lambda c: c.data.startswith('rate_'))
-async def handle_answer(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    data = callback_query.data.split('_')
-    rating = int(data[1])
-    question_id = int(data[2])
-    
-    test_type, questions, current_index, answers = db.get_active_test(user_id)
-    
-    if not questions:
-        await callback_query.answer("❌ Тест не найден")
-        return
-    
-    answers[str(question_id)] = rating
-    current_index += 1
-    
-    db.save_active_test(user_id, test_type, questions, current_index, answers)
-    
-    await callback_query.answer(f"✅ Ответ сохранен")
-    
-    if current_index >= len(questions):
-        await finish_test(callback_query.message, user_id)
-    else:
-        await callback_query.message.delete()
-        await send_test_question(callback_query.message, user_id, current_index)
-
-async def finish_test(message: types.Message, user_id):
-    test_type, questions, current_index, answers = db.get_active_test(user_id)
-    
-    if not answers:
-        await message.answer("❌ Тест не был начат.")
-        return
-    
-    employee = db.get_employee(user_id)
-    position = employee[0] if employee else "Не указана"
-    department = employee[1] if employee else "Не указан"
-    experience = employee[2] if employee else "Не указан"
-    
-    # Считаем баллы (0-100)
-    total_questions = len(answers)
-    total_score = sum(answers.values())
-    
-    # Нормализуем: если ответы 0-2, то 0-100
-    max_possible = total_questions * 2  # так как максимум 2
-    score = (total_score / max_possible) * 100 if max_possible > 0 else 0
-    score = round(score, 1)
-    
-    # Уровень
-    if score >= 80:
-        level = "🟢 Отлично"
-    elif score >= 60:
-        level = "🟡 Хорошо"
-    elif score >= 40:
-        level = "🟠 Средне"
-    else:
-        level = "🔴 Требуется внимание"
-    
-    # Сохраняем результат
-    db.save_test_result(test_type, position, department, experience, answers, score, level)
-    db.mark_participant(user_id, test_type)
-    db.clear_active_test(user_id)
-    
-    await message.answer(
-        f"✅ *Тест '{test_type}' завершен!*\n\n"
-        f"📊 Ваш результат: {score:.1f}%\n"
-        f"📈 Уровень: {level}\n\n"
-        "Спасибо за участие! 🙌\n"
-        "Все ответы анонимны! 🕵️",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard(user_id)
-    )
-
-# ===================== СТАТИСТИКА =====================
-async def show_user_stats(message: types.Message, user_id):
-    results = db.cursor.execute('SELECT test_type, score, level, date FROM test_results WHERE position IN (SELECT position FROM employees WHERE user_id = ?) ORDER BY date DESC', (user_id,)).fetchall()
-    
-    if not results:
-        await message.answer("📊 Вы еще не проходили тесты.")
-        return
-    
-    text = "📊 *Моя статистика*\n\n"
-    for test_type, score, level, date in results[:10]:
-        d = datetime.fromisoformat(date).strftime("%d.%m %H:%M")
-        text += f"📝 {test_type}: {score:.1f}% {level}\n"
-        text += f"   🕐 {d}\n\n"
-    
-    await message.answer(text, parse_mode="Markdown")
-
-async def show_top_hr(message: types.Message):
-    results = db.cursor.execute('''
-        SELECT position, department, experience, score, level, date, test_type
-        FROM test_results
-        ORDER BY score DESC
-        LIMIT 15
-    ''').fetchall()
-    
-    if not results:
-        await message.answer("🏆 Пока нет данных.")
-        return
-    
-    text = "🏆 *Топ сотрудников (анонимно)*\n\n"
-    
-    for i, (position, department, experience, score, level, date, test_type) in enumerate(results, 1):
-        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        text += f"{medal} {position}\n"
-        text += f"   📊 {department} | {test_type}\n"
-        text += f"   📈 {score:.1f}% {level}\n\n"
-    
-    await message.answer(text, parse_mode="Markdown")
-
-# ===================== АДМИН-ПАНЕЛЬ =====================
-@dp.message_handler(lambda message: message.text in [
-    "📢 Рассылка", "➕ Добавить вопрос", "✏️ Редактировать вопрос",
-    "❌ Удалить вопрос", "📊 Статистика", "👑 Назначить админа",
-    "🗑 Очистить БД", "🔙 Главное меню"
-])
-async def handle_admin_buttons(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if not db.is_admin(user_id):
-        await message.answer("⛔ Нет прав")
-        return
-    
-    if message.text == "🔙 Главное меню":
-        await message.answer("🔙 Возврат", reply_markup=get_main_keyboard(user_id))
-    
-    elif message.text == "📢 Рассылка":
-        await message.answer("📢 Введите текст рассылки:")
-        await AdminStates.waiting_for_broadcast.set()
-    
-    elif message.text == "➕ Добавить вопрос":
-        await message.answer(
-            "📝 *Добавление вопроса*\n\n"
-            "Формат: `Тест | Вопрос | Вариант1 | Вариант2 | Вариант3`\n\n"
-            "Пример: `Лояльность | Как вы оцениваете? | Плохо | Нормально | Отлично`",
-            parse_mode="Markdown"
-        )
-        await AdminStates.waiting_for_question_add.set()
-    
-    elif message.text == "✏️ Редактировать вопрос":
-        questions = db.get_all_questions()
-        if not questions:
-            await message.answer("❌ Вопросов нет.")
-            return
+    # ---- Добавление задачи с датой ----
+    elif step == 'add_task_date':
+        title = text
+        date_str = context.user_data.get('selected_date', datetime.now().strftime('%Y-%m-%d'))
         
-        text = "✏️ *Выберите вопрос*\n\n"
-        for q in questions[:15]:
-            text += f"ID: {q[0]}. [{q[1]}] {q[2][:40]}...\n"
-        text += "\nВведите ID вопроса:"
-        await message.answer(text, parse_mode="Markdown")
-        await AdminStates.waiting_for_question_edit.set()
-    
-    elif message.text == "❌ Удалить вопрос":
-        questions = db.get_all_questions()
-        if not questions:
-            await message.answer("❌ Вопросов нет.")
-            return
+        keyboard = [
+            [InlineKeyboardButton("🔴 Высокий", callback_data=f'set_priority_high_{title}_{date_str}')],
+            [InlineKeyboardButton("🟡 Средний", callback_data=f'set_priority_medium_{title}_{date_str}')],
+            [InlineKeyboardButton("🟢 Низкий", callback_data=f'set_priority_low_{title}_{date_str}')]
+        ]
         
-        text = "❌ *Удаление вопроса*\n\n"
-        for q in questions[:15]:
-            text += f"ID: {q[0]}. {q[2][:40]}...\n"
-        text += "\nВведите ID:"
-        await message.answer(text, parse_mode="Markdown")
-        await AdminStates.waiting_for_question_delete.set()
-    
-    elif message.text == "📊 Статистика":
-        await show_admin_stats(message)
-    
-    elif message.text == "👑 Назначить админа":
-        await message.answer(
-            "👑 *Назначение администратора*\n\n"
-            "Введите Telegram ID:\n\n"
-            "Текущие админы:",
-            parse_mode="Markdown"
+        await update.message.reply_text(
+            f"✏️ *{title}*\n\n📅 Дата: {date_str}\n\nВыберите приоритет:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
         )
-        admins = db.get_all_admins()
-        text = ""
-        for a in admins:
-            text += f"🆔 `{a}`\n"
-        await message.answer(text or "Нет админов", parse_mode="Markdown")
-        await AdminStates.waiting_for_admin_add.set()
+        context.user_data['step'] = 'add_task_priority'
+        context.user_data['task_title'] = title
+        context.user_data['task_date'] = date_str
+
+# ===================== КОЛБЭКИ ДЛЯ ДОБАВЛЕНИЯ ЗАДАЧ =====================
+async def add_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await query.edit_message_text("⛔ Доступ запрещен.")
+        return
     
-    elif message.text == "🗑 Очистить БД":
-        keyboard = InlineKeyboardMarkup()
-        keyboard.add(
-            InlineKeyboardButton("✅ ДА, ОЧИСТИТЬ ВСЁ", callback_data="confirm_clear_db"),
-            InlineKeyboardButton("❌ ОТМЕНА", callback_data="cancel_clear_db")
+    data = query.data
+    
+    # ---- Выбор категории ----
+    if data.startswith('set_cat_'):
+        category = data.replace('set_cat_', '')
+        context.user_data['task_category'] = category
+        
+        keyboard = [
+            [InlineKeyboardButton("🔴 Высокий", callback_data='priority_high')],
+            [InlineKeyboardButton("🟡 Средний", callback_data='priority_medium')],
+            [InlineKeyboardButton("🟢 Низкий", callback_data='priority_low')]
+        ]
+        
+        await query.edit_message_text(
+            f"✏️ *{context.user_data.get('task_title', '')}*\n\n"
+            f"📂 Категория: {category}\n\n"
+            "Выберите приоритет:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
         )
-        await message.answer(
-            "⚠️ *Очистка базы данных*\n\n"
-            "Будут удалены:\n"
-            "✅ Все результаты тестов\n"
-            "✅ Все участники\n\n"
-            "❓ Вопросы останутся.\n\n"
-            "Вы уверены?",
-            parse_mode="Markdown",
-            reply_markup=keyboard
+        context.user_data['step'] = 'add_task_priority'
+    
+    # ---- Выбор приоритета ----
+    elif data.startswith('priority_'):
+        priority_map = {
+            'priority_high': 'Высокий',
+            'priority_medium': 'Средний',
+            'priority_low': 'Низкий'
+        }
+        priority = priority_map.get(data, 'Средний')
+        
+        # Получаем данные из контекста
+        title = context.user_data.get('task_title', 'Без названия')
+        category = context.user_data.get('task_category', 'Работа')
+        due_date = context.user_data.get('task_date', None)
+        
+        # Сохраняем задачу
+        task_id = db.add_task(title, "", category, priority, due_date)
+        
+        context.user_data['step'] = None
+        context.user_data['task_title'] = None
+        context.user_data['task_category'] = None
+        context.user_data['task_date'] = None
+        
+        priority_emoji = {"Высокий": "🔴", "Средний": "🟡", "Низкий": "🟢"}.get(priority, "🟡")
+        date_text = f" (до {due_date})" if due_date else ""
+        
+        await query.edit_message_text(
+            f"✅ *Задача добавлена!*\n\n"
+            f"{priority_emoji} *{title}*{date_text}\n"
+            f"📂 Категория: {category}\n"
+            f"🔵 Приоритет: {priority}",
+            reply_markup=main_menu(),
+            parse_mode='Markdown'
         )
 
-@dp.callback_query_handler(lambda c: c.data == 'confirm_clear_db')
-async def confirm_clear_db(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if not db.is_admin(user_id):
-        await callback_query.answer("⛔ Нет прав")
-        return
+# ===================== ОСНОВНАЯ ФУНКЦИЯ =====================
+def main():
+    app = Application.builder().token(TOKEN).build()
     
-    db.cursor.execute('DELETE FROM test_results')
-    db.cursor.execute('DELETE FROM test_participants')
-    db.cursor.execute('DELETE FROM sqlite_sequence')
-    db.conn.commit()
+    # Обработчики
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(CallbackQueryHandler(add_task_callback, pattern='^(set_cat_|priority_)'))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    await callback_query.answer()
-    await callback_query.message.edit_text(
-        "✅ *База данных очищена!*",
-        parse_mode="Markdown"
-    )
-
-@dp.callback_query_handler(lambda c: c.data == 'cancel_clear_db')
-async def cancel_clear_db(callback_query: types.CallbackQuery):
-    await callback_query.answer()
-    await callback_query.message.edit_text("🔙 Операция отменена.")
-
-# ===================== АДМИН: РАССЫЛКА =====================
-@dp.message_handler(state=AdminStates.waiting_for_broadcast)
-async def process_broadcast(message: types.Message, state: FSMContext):
-    employees = db.get_all_employees()
-    sent = 0
-    
-    for user_id, pos, dept, exp in employees:
-        try:
-            await bot.send_message(
-                user_id,
-                f"📢 *Объявление HR*\n\n{message.text}",
-                parse_mode="Markdown"
-            )
-            sent += 1
-        except:
-            pass
-    
-    await state.finish()
-    await message.answer(f"✅ Рассылка отправлена {sent} сотрудникам.", reply_markup=get_admin_keyboard())
-
-# ===================== АДМИН: ВОПРОСЫ =====================
-@dp.message_handler(state=AdminStates.waiting_for_question_add)
-async def process_add_question(message: types.Message, state: FSMContext):
-    try:
-        parts = [p.strip() for p in message.text.split('|')]
-        if len(parts) != 5:
-            await message.answer("❌ Формат: `Тест | Вопрос | Вариант1 | Вариант2 | Вариант3`")
-            return
-        
-        test_type = parts[0]
-        question_text = parts[1]
-        options = parts[2:5]
-        
-        db.add_question(test_type, question_text, options)
-        await state.finish()
-        await message.answer("✅ Вопрос добавлен!", reply_markup=get_admin_keyboard())
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {str(e)}")
-
-@dp.message_handler(state=AdminStates.waiting_for_question_edit)
-async def process_edit_question(message: types.Message, state: FSMContext):
-    try:
-        question_id = int(message.text.strip())
-        question = db.get_question_by_id(question_id)
-        if not question:
-            await message.answer("❌ Вопрос не найден.")
-            return
-        
-        await state.update_data(edit_id=question_id)
-        await message.answer(
-            f"✏️ *Редактирование #{question_id}*\n\n"
-            f"Текущий: {question[2]}\n\n"
-            "Введите новые данные в формате:\n"
-            "`Тест | Вопрос | Вариант1 | Вариант2 | Вариант3`",
-            parse_mode="Markdown"
-        )
-        await AdminStates.waiting_for_question_edit_save.set()
-    except:
-        await message.answer("❌ Введите число (ID).")
-
-@dp.message_handler(state=AdminStates.waiting_for_question_edit_save)
-async def process_edit_question_save(message: types.Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        question_id = data.get('edit_id')
-        
-        parts = [p.strip() for p in message.text.split('|')]
-        if len(parts) != 5:
-            await message.answer("❌ Неверный формат.")
-            return
-        
-        db.update_question(question_id, parts[1], parts[2:5])
-        await state.finish()
-        await message.answer("✅ Вопрос обновлен!", reply_markup=get_admin_keyboard())
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {str(e)}")
-
-@dp.message_handler(state=AdminStates.waiting_for_question_delete)
-async def process_delete_question(message: types.Message, state: FSMContext):
-    try:
-        question_id = int(message.text.strip())
-        if not db.get_question_by_id(question_id):
-            await message.answer("❌ Вопрос не найден.")
-            return
-        
-        db.delete_question(question_id)
-        await state.finish()
-        await message.answer(f"✅ Вопрос #{question_id} удален.", reply_markup=get_admin_keyboard())
-    except:
-        await message.answer("❌ Введите число (ID).")
-
-# ===================== АДМИН: СТАТИСТИКА =====================
-async def show_admin_stats(message: types.Message):
-    test_types = db.get_test_types()
-    
-    if not test_types:
-        await message.answer("📊 Нет данных для статистики.")
-        return
-    
-    text = "📊 *АНОНИМНАЯ СТАТИСТИКА*\n\n"
-    
-    for test_type in test_types:
-        general, levels, by_dept, by_pos, by_exp, top = db.get_test_stats(test_type)
-        
-        text += f"📝 *{test_type}*\n"
-        if general and general[0] > 0:
-            text += f"👥 Участников: {general[0]}\n"
-            text += f"📈 Средний: {general[1]:.1f}%\n"
-            text += f"📉 Мин: {general[2]:.1f}%\n"
-            text += f"📈 Макс: {general[3]:.1f}%\n"
-        else:
-            text += "Нет данных\n"
-        text += "\n"
-    
-    await message.answer(text, parse_mode="Markdown")
-
-# ===================== АДМИН: НАЗНАЧЕНИЕ =====================
-@dp.message_handler(state=AdminStates.waiting_for_admin_add)
-async def process_assign_admin(message: types.Message, state: FSMContext):
-    try:
-        user_id = int(message.text.strip())
-        db.add_admin(user_id)
-        await state.finish()
-        await message.answer(f"✅ Пользователь {user_id} назначен админом!", reply_markup=get_admin_keyboard())
-        
-        try:
-            await bot.send_message(user_id, "🔑 Вам назначены права администратора!")
-        except:
-            pass
-    except:
-        await message.answer("❌ Введите корректный ID.")
-
-# ===================== КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ =====================
-@dp.message_handler(commands=['admins'])
-async def show_admins(message: types.Message):
-    user_id = message.from_user.id
-    if not db.is_admin(user_id):
-        await message.answer("⛔ Нет доступа")
-        return
-    
-    admins = db.get_all_admins()
-    if not admins:
-        await message.answer("👑 Список админов пуст.")
-        return
-    
-    text = "👑 *Администраторы:*\n\n"
-    for admin_id in admins:
-        text += f"🆔 `{admin_id}`\n"
-    
-    await message.answer(text, parse_mode="Markdown")
-
-@dp.message_handler(commands=['addadmin'])
-async def add_admin_command(message: types.Message):
-    user_id = message.from_user.id
-    if not db.is_admin(user_id):
-        await message.answer("⛔ Нет доступа")
-        return
-    
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("❌ /addadmin <TELEGRAM_ID>")
-        return
-    
-    try:
-        new_admin_id = int(args[1])
-        db.add_admin(new_admin_id)
-        await message.answer(f"✅ Пользователь `{new_admin_id}` назначен админом!", parse_mode="Markdown")
-    except:
-        await message.answer("❌ Введите корректный ID.")
-
-@dp.message_handler(commands=['removeadmin'])
-async def remove_admin_command(message: types.Message):
-    user_id = message.from_user.id
-    if not db.is_admin(user_id):
-        await message.answer("⛔ Нет доступа")
-        return
-    
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("❌ /removeadmin <TELEGRAM_ID>")
-        return
-    
-    try:
-        remove_id = int(args[1])
-        if remove_id == user_id:
-            await message.answer("❌ Нельзя удалить самого себя!")
-            return
-        
-        db.remove_admin(remove_id)
-        await message.answer(f"✅ Админ `{remove_id}` удален!", parse_mode="Markdown")
-    except:
-        await message.answer("❌ Введите корректный ID.")
-
-@dp.message_handler(commands=['dbstatus'])
-async def db_status_command(message: types.Message):
-    user_id = message.from_user.id
-    if not db.is_admin(user_id):
-        await message.answer("⛔ Нет доступа")
-        return
-    
-    db.cursor.execute('SELECT COUNT(*) FROM employees')
-    employees = db.cursor.fetchone()[0]
-    
-    db.cursor.execute('SELECT COUNT(*) FROM test_results')
-    results = db.cursor.fetchone()[0]
-    
-    db.cursor.execute('SELECT COUNT(*) FROM test_participants')
-    participants = db.cursor.fetchone()[0]
-    
-    db.cursor.execute('SELECT COUNT(*) FROM test_questions WHERE is_active = 1')
-    questions = db.cursor.fetchone()[0]
-    
-    db.cursor.execute('SELECT COUNT(*) FROM admins')
-    admins = db.cursor.fetchone()[0]
-    
-    text = "📊 *Состояние БД:*\n\n"
-    text += f"👥 Сотрудников: {employees}\n"
-    text += f"📝 Результатов: {results}\n"
-    text += f"👤 Участников: {participants}\n"
-    text += f"❓ Вопросов: {questions}\n"
-    text += f"👑 Админов: {admins}\n"
-    
-    if admins > 0:
-        admin_list = [str(a) for a in db.get_all_admins()]
-        text += f"\n👑 Админы: `{', '.join(admin_list)}`"
-    
-    await message.answer(text, parse_mode="Markdown")
-
-# ===================== ОБРАБОТКА НЕИЗВЕСТНЫХ =====================
-@dp.message_handler()
-async def unknown_command(message: types.Message):
-    user_id = message.from_user.id
-    if db.is_registered(user_id):
-        await message.answer(
-            "❓ Неизвестная команда.\n\n"
-            "Используйте кнопки меню.",
-            reply_markup=get_main_keyboard(user_id)
-        )
-    else:
-        await message.answer("👋 Для начала отправьте /start")
-
-# ===================== ЗАПУСК =====================
-if __name__ == "__main__":
-    print("🚀 Запуск HR Pulse бота...")
+    print("=" * 50)
+    print("🤖 Бот-планировщик запущен!")
+    print(f"👤 Админ ID: {ADMIN_ID}")
+    print("📋 Функции: Задачи, Календарь, Погода, Статистика")
     print("=" * 50)
     
-    try:
-        for admin_id in ADMINS:
-            db.add_admin(admin_id)
-        
-        init_tests()
-        
-        print(f"✅ Бот запущен!")
-        print(f"👤 Админы: {ADMINS}")
-        print(f"📊 Тесты: Лояльность, Выгорание, Вовлеченность, Стресс")
-        print(f"🕵️ Все ответы анонимны!")
-        print("=" * 50)
-        print("💬 Бот готов...")
-        
-        executor.start_polling(dp, skip_updates=True)
-    except Exception as e:
-        print(f"❌ Ошибка: {e}")
-        sys.exit(1)
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
