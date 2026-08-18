@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Планировщик задач с календарём, погодой и напоминаниями
+Планировщик задач с Яндекс API (погода, геокодер, поиск организаций)
 """
 
 import os
@@ -18,11 +18,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = "8811262187:AAEssO3CfPRKIXJW1Qh3Nxj-je-yKTBJLnc"
-ADMIN_ID = 1024761707  # Без кавычек!
+ADMIN_ID = 1024761707
 
-# API для погоды (бесплатный OpenWeatherMap)
-WEATHER_API_KEY = ""  # Получить на openweathermap.org (бесплатно)
-DEFAULT_CITY = "Moscow"
+# ===================== ЯНДЕКС API =====================
+YANDEX_API_KEY = "7279c195-0ee9-4963-bcdc-92c563614bb8"
+YANDEX_GEOCODER_URL = "https://geocode-maps.yandex.ru/1.x/"
+YANDEX_WEATHER_URL = "https://api.weather.yandex.ru/v2/forecast"
+YANDEX_SEARCH_URL = "https://search-maps.yandex.ru/v1/"
+YANDEX_SUGGEST_URL = "https://suggest-maps.yandex.ru/v1/suggest"
 
 # ===================== БАЗА ДАННЫХ =====================
 class Database:
@@ -32,7 +35,6 @@ class Database:
         self._create_tables()
     
     def _create_tables(self):
-        # Задачи
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,7 +49,6 @@ class Database:
             )
         ''')
         
-        # Категории
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,18 +57,6 @@ class Database:
             )
         ''')
         
-        # Напоминания
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS reminders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id INTEGER,
-                remind_at TEXT,
-                is_sent INTEGER DEFAULT 0,
-                FOREIGN KEY (task_id) REFERENCES tasks (id)
-            )
-        ''')
-        
-        # Настройки
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -76,13 +65,15 @@ class Database:
         ''')
         self.conn.commit()
         
-        # Добавляем категории по умолчанию
         default_categories = ['Работа', 'Личное', 'Учёба', 'Здоровье', 'Финансы', 'Развлечения']
         for cat in default_categories:
             self.cursor.execute('INSERT OR IGNORE INTO categories (name) VALUES (?)', (cat,))
         self.conn.commit()
+        
+        # Сохраняем город по умолчанию
+        self.cursor.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('city', 'Москва'))
+        self.conn.commit()
     
-    # ---- Задачи ----
     def add_task(self, title, description="", category="Работа", priority="Средний", due_date=None, reminder_time=None):
         self.cursor.execute('''
             INSERT INTO tasks (title, description, category, priority, due_date, created_at, reminder_time)
@@ -136,8 +127,188 @@ class Database:
         by_category = self.cursor.fetchall()
         
         return active, completed, by_category
+    
+    def get_setting(self, key):
+        self.cursor.execute('SELECT value FROM settings WHERE key = ?', (key,))
+        result = self.cursor.fetchone()
+        return result[0] if result else None
+    
+    def set_setting(self, key, value):
+        self.cursor.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, value))
+        self.conn.commit()
 
 db = Database()
+
+# ===================== ЯНДЕКС API ФУНКЦИИ =====================
+
+def geocode_address(address):
+    """Получить координаты по адресу через Яндекс Геокодер"""
+    try:
+        params = {
+            'apikey': YANDEX_API_KEY,
+            'geocode': address,
+            'format': 'json',
+            'results': 1
+        }
+        response = requests.get(YANDEX_GEOCODER_URL, params=params, timeout=10)
+        data = response.json()
+        
+        geo_objects = data.get('response', {}).get('GeoObjectCollection', {}).get('featureMember', [])
+        if not geo_objects:
+            return None, None
+        
+        coords = geo_objects[0].get('GeoObject', {}).get('Point', {}).get('pos', '').split()
+        if len(coords) == 2:
+            lon, lat = coords[0], coords[1]
+            return float(lat), float(lon)
+        return None, None
+    except Exception as e:
+        logger.error(f"Geocode error: {e}")
+        return None, None
+
+def get_weather_by_city(city):
+    """Получить погоду через Яндекс API"""
+    try:
+        # 1. Получаем координаты города
+        lat, lon = geocode_address(city)
+        if not lat or not lon:
+            return f"❌ Город '{city}' не найден"
+        
+        # 2. Получаем погоду
+        headers = {'X-Yandex-API-Key': YANDEX_API_KEY}
+        params = {
+            'lat': lat,
+            'lon': lon,
+            'lang': 'ru_RU',
+            'limit': 1
+        }
+        
+        response = requests.get(YANDEX_WEATHER_URL, headers=headers, params=params, timeout=10)
+        data = response.json()
+        
+        if 'fact' not in data:
+            return "❌ Ошибка получения погоды"
+        
+        fact = data['fact']
+        forecast = data.get('forecasts', [{}])[0]
+        
+        temp = fact.get('temp', 0)
+        feels_like = fact.get('feels_like', 0)
+        humidity = fact.get('humidity', 0)
+        wind_speed = fact.get('wind_speed', 0)
+        pressure = fact.get('pressure_mm', 0)
+        
+        # Описание погоды
+        condition_map = {
+            'clear': '☀️ Ясно',
+            'partly-cloudy': '⛅️ Малооблачно',
+            'cloudy': '☁️ Облачно',
+            'overcast': '☁️ Пасмурно',
+            'drizzle': '🌧 Морось',
+            'light-rain': '🌧 Небольшой дождь',
+            'rain': '🌧 Дождь',
+            'moderate-rain': '🌧 Умеренный дождь',
+            'heavy-rain': '🌧 Сильный дождь',
+            'continuous-heavy-rain': '🌧 Продолжительный дождь',
+            'showers': '🌧 Ливень',
+            'wet-snow': '🌨 Мокрый снег',
+            'light-snow': '🌨 Небольшой снег',
+            'snow': '🌨 Снег',
+            'snow-showers': '🌨 Снегопад',
+            'hail': '🌨 Град',
+            'thunderstorm': '⛈ Гроза',
+            'thunderstorm-with-rain': '⛈ Дождь с грозой',
+            'thunderstorm-with-hail': '⛈ Град с грозой'
+        }
+        condition = condition_map.get(fact.get('condition', ''), fact.get('condition', 'Неизвестно'))
+        
+        # Восход/закат
+        sunrise = forecast.get('sunrise', '')
+        sunset = forecast.get('sunset', '')
+        
+        text = f"🌤 *Погода в {city}*\n\n"
+        text += f"🌡 Температура: {temp}°C (ощущается {feels_like}°C)\n"
+        text += f"☁️ {condition}\n"
+        text += f"💧 Влажность: {humidity}%\n"
+        text += f"🌬 Ветер: {wind_speed} м/с\n"
+        text += f"📊 Давление: {pressure} мм рт. ст.\n"
+        if sunrise and sunset:
+            text += f"🌅 Рассвет: {sunrise}\n"
+            text += f"🌇 Закат: {sunset}\n"
+        
+        return text
+        
+    except Exception as e:
+        logger.error(f"Weather error: {e}")
+        return f"❌ Ошибка получения погоды: {str(e)}"
+
+def search_organizations(query, lat=None, lon=None, city=None):
+    """Поиск организаций через Яндекс API"""
+    try:
+        # Если указан город, получаем координаты
+        if city and not lat:
+            lat, lon = geocode_address(city)
+        
+        params = {
+            'apikey': YANDEX_API_KEY,
+            'text': query,
+            'lang': 'ru_RU',
+            'type': 'biz',
+            'results': 10
+        }
+        
+        if lat and lon:
+            params['ll'] = f"{lon},{lat}"
+            params['spn'] = '0.05,0.05'
+        
+        response = requests.get(YANDEX_SEARCH_URL, params=params, timeout=10)
+        data = response.json()
+        
+        features = data.get('features', [])
+        if not features:
+            return "❌ Ничего не найдено"
+        
+        text = f"🔍 *Результаты поиска: {query}*\n\n"
+        
+        for i, feature in enumerate(features[:10], 1):
+            props = feature.get('properties', {})
+            name = props.get('name', 'Без названия')
+            address = props.get('address', '')
+            
+            text += f"{i}. *{name}*\n"
+            if address:
+                text += f"   📍 {address}\n"
+            text += "\n"
+        
+        return text
+        
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        return f"❌ Ошибка поиска: {str(e)}"
+
+def get_address_suggestions(query):
+    """Геосаджест (подсказки адресов)"""
+    try:
+        params = {
+            'apikey': YANDEX_API_KEY,
+            'text': query,
+            'lang': 'ru_RU',
+            'type': 'geo',
+            'results': 5
+        }
+        
+        response = requests.get(YANDEX_SUGGEST_URL, params=params, timeout=10)
+        data = response.json()
+        
+        suggestions = data.get('suggestions', [])
+        if not suggestions:
+            return []
+        
+        return [s.get('displayText', '') for s in suggestions]
+        
+    except Exception as e:
+        logger.error(f"Suggest error: {e}")
+        return []
 
 # ===================== КЛАВИАТУРЫ =====================
 def main_menu():
@@ -147,6 +318,7 @@ def main_menu():
         [InlineKeyboardButton("📊 Статистика", callback_data='stats')],
         [InlineKeyboardButton("🗂 Категории", callback_data='categories')],
         [InlineKeyboardButton("🌤 Погода", callback_data='weather')],
+        [InlineKeyboardButton("🔍 Поиск организаций", callback_data='search_orgs')],
         [InlineKeyboardButton("📅 Календарь", callback_data='calendar')],
         [InlineKeyboardButton("⚙️ Настройки", callback_data='settings')],
         [InlineKeyboardButton("❓ Помощь", callback_data='help')]
@@ -179,25 +351,22 @@ def priority_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def calendar_keyboard(year, month):
+    import calendar
     keyboard = []
-    # Заголовок с месяцем
+    
     month_names = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
                    'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь']
+    
     keyboard.append([InlineKeyboardButton(f"📅 {month_names[month-1]} {year}", callback_data='noop')])
     
     # Дни недели
-    keyboard.append([
-        InlineKeyboardButton("Пн", callback_data='noop'),
-        InlineKeyboardButton("Вт", callback_data='noop'),
-        InlineKeyboardButton("Ср", callback_data='noop'),
-        InlineKeyboardButton("Чт", callback_data='noop'),
-        InlineKeyboardButton("Пт", callback_data='noop'),
-        InlineKeyboardButton("Сб", callback_data='noop'),
-        InlineKeyboardButton("Вс", callback_data='noop')
-    ])
+    week_days = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+    row = []
+    for day in week_days:
+        row.append(InlineKeyboardButton(day, callback_data='noop'))
+    keyboard.append(row)
     
     # Дни месяца
-    import calendar
     cal = calendar.monthcalendar(year, month)
     for week in cal:
         row = []
@@ -224,35 +393,6 @@ def calendar_keyboard(year, month):
     
     return InlineKeyboardMarkup(keyboard)
 
-# ===================== ПОГОДА =====================
-def get_weather(city=DEFAULT_CITY):
-    if not WEATHER_API_KEY:
-        return "🌤 API ключ не настроен. Получите бесплатный ключ на openweathermap.org"
-    
-    try:
-        url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={WEATHER_API_KEY}&units=metric&lang=ru"
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        
-        if data.get('cod') != 200:
-            return f"❌ Город не найден: {city}"
-        
-        temp = data['main']['temp']
-        feels_like = data['main']['feels_like']
-        humidity = data['main']['humidity']
-        description = data['weather'][0]['description']
-        wind = data['wind']['speed']
-        
-        text = f"🌤 *Погода в {city}*\n\n"
-        text += f"🌡 Температура: {temp:.1f}°C (ощущается {feels_like:.1f}°C)\n"
-        text += f"💧 Влажность: {humidity}%\n"
-        text += f"🌬 Ветер: {wind} м/с\n"
-        text += f"📝 {description.capitalize()}"
-        
-        return text
-    except Exception as e:
-        return f"❌ Ошибка получения погоды: {str(e)}"
-
 # ===================== ОБРАБОТЧИКИ =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -261,11 +401,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     await update.message.reply_text(
-        "🤖 *Планировщик задач*\n\n"
+        "🤖 *Планировщик задач с Яндекс API*\n\n"
         "📋 *Что я умею:*\n"
         "• Создавать задачи с категориями и приоритетами\n"
         "• Устанавливать сроки и напоминания\n"
-        "• Показывать погоду\n"
+        "• Показывать погоду через Яндекс API\n"
+        "• Искать организации (магазины, аптеки, кафе)\n"
         "• Вести статистику задач\n"
         "• Работать с календарём\n\n"
         "Выберите действие:",
@@ -283,7 +424,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     data = query.data
     
-    # ----- Главное меню -----
     if data == 'back_to_menu':
         await query.edit_message_text(
             "🤖 *Планировщик задач*\n\nВыберите действие:",
@@ -291,7 +431,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
     
-    # ----- Список задач -----
     elif data == 'list_tasks':
         tasks = db.get_tasks()
         if not tasks:
@@ -317,18 +456,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text += f"   📝 {desc[:50]}\n"
             text += "\n"
         
-        text += "\n_Выберите задачу для управления или нажмите кнопку ниже:_"
+        text += "\n_Выберите задачу для управления:_"
         
-        # Кнопки для каждой задачи
         keyboard = []
-        for task in tasks[:10]:  # Показываем первые 10
+        for task in tasks[:10]:
             task_id = task[0]
             keyboard.append([InlineKeyboardButton(f"• {task[1][:30]}", callback_data=f'task_{task_id}')])
         keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')])
         
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     
-    # ----- Просмотр задачи -----
     elif data.startswith('task_'):
         task_id = int(data.split('_')[1])
         task = db.get_task_by_id(task_id)
@@ -349,7 +486,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.edit_message_text(text, reply_markup=task_actions_keyboard(task_id), parse_mode='Markdown')
     
-    # ----- Действия с задачей -----
     elif data.startswith('done_'):
         task_id = int(data.split('_')[1])
         db.update_task_status(task_id, 'completed')
@@ -367,9 +503,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     
     elif data == 'back_to_list':
-        await button_handler(update, context)  # Перезапускаем список
+        await button_handler(update, context)
     
-    # ----- Добавление задачи -----
     elif data == 'add_task_start':
         await query.edit_message_text(
             "✏️ *Добавление задачи*\n\n"
@@ -378,7 +513,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data['step'] = 'add_task_title'
     
-    # ----- Категории -----
     elif data == 'categories':
         await query.edit_message_text(
             "📂 *Категории задач*\n\n"
@@ -422,7 +556,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data['step'] = 'add_category'
     
-    # ----- Статистика -----
     elif data == 'stats':
         active, completed, by_category = db.get_stats()
         
@@ -440,18 +573,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.edit_message_text(text, reply_markup=main_menu(), parse_mode='Markdown')
     
-    # ----- Погода -----
+    # ----- ПОГОДА (Яндекс) -----
     elif data == 'weather':
-        weather_text = get_weather()
+        city = db.get_setting('city') or 'Москва'
+        weather_text = get_weather_by_city(city)
         await query.edit_message_text(
             weather_text,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Обновить", callback_data='weather')],
-                [InlineKeyboardButton("🌍 Другой город", callback_data='change_city')],
+                [InlineKeyboardButton("🌍 Сменить город", callback_data='change_city')],
                 [InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')]
             ]),
             parse_mode='Markdown'
         )
+    
+    # ----- ПОИСК ОРГАНИЗАЦИЙ (Яндекс) -----
+    elif data == 'search_orgs':
+        await query.edit_message_text(
+            "🔍 *Поиск организаций*\n\n"
+            "Введите название организации или услуги:\n"
+            "• Магазины\n"
+            "• Аптеки\n"
+            "• Кафе\n"
+            "• Банки\n"
+            "• и т.д.",
+            parse_mode='Markdown'
+        )
+        context.user_data['step'] = 'search_orgs'
     
     elif data == 'change_city':
         await query.edit_message_text(
@@ -461,7 +609,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data['step'] = 'change_city'
     
-    # ----- Календарь -----
+    # ----- КАЛЕНДАРЬ -----
     elif data.startswith('calendar'):
         if data == 'calendar_today':
             now = datetime.now()
@@ -479,7 +627,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date_str = data.replace('date_', '')
         context.user_data['selected_date'] = date_str
         
-        # Показываем задачи на эту дату
         tasks = db.get_tasks()
         tasks_on_date = [t for t in tasks if t[5] == date_str]
         
@@ -505,10 +652,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data['step'] = 'add_task_date'
     
-    # ----- Настройки -----
+    # ----- НАСТРОЙКИ -----
     elif data == 'settings':
         keyboard = [
-            [InlineKeyboardButton("🌤 Город для погоды", callback_data='change_city')],
+            [InlineKeyboardButton("🌍 Сменить город", callback_data='change_city')],
             [InlineKeyboardButton("🗑 Очистить все задачи", callback_data='clear_all')],
             [InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')]
         ]
@@ -539,7 +686,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_menu()
         )
     
-    # ----- Помощь -----
     elif data == 'help':
         text = "❓ *Помощь*\n\n"
         text += "🤖 *Что я умею:*\n"
@@ -547,7 +693,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "➕ *Добавить дело* — создать новую задачу\n"
         text += "📊 *Статистика* — общая статистика задач\n"
         text += "🗂 *Категории* — задачи по категориям\n"
-        text += "🌤 *Погода* — погода в вашем городе\n"
+        text += "🌤 *Погода* — погода в вашем городе (Яндекс)\n"
+        text += "🔍 *Поиск организаций* — поиск магазинов, кафе, аптек (Яндекс)\n"
         text += "📅 *Календарь* — просмотр задач по датам\n\n"
         text += "📝 *Как добавить задачу:*\n"
         text += "1. Нажмите '➕ Добавить дело'\n"
@@ -583,7 +730,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == 'add_task_title':
         context.user_data['task_title'] = text
         
-        # Показываем категории
         categories = db.get_categories()
         keyboard = []
         for cat in categories:
@@ -598,14 +744,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data['step'] = 'add_task_category'
     
-    # ---- Добавление задачи (шаг 2: категория через callback) ----
-    # Обрабатывается в button_handler
-    
-    # ---- Добавление задачи (шаг 3: приоритет) ----
-    elif step == 'add_task_priority':
-        # Сохраняем приоритет из callback
-        pass
-    
     # ---- Добавление категории ----
     elif step == 'add_category':
         db.cursor.execute('INSERT OR IGNORE INTO categories (name) VALUES (?)', (text,))
@@ -619,12 +757,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---- Смена города ----
     elif step == 'change_city':
         context.user_data['step'] = None
-        # Сохраняем город в настройках
-        db.cursor.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ('city', text))
-        db.conn.commit()
+        db.set_setting('city', text)
         await update.message.reply_text(
             f"🌍 Город изменён на {text}",
             reply_markup=main_menu()
+        )
+    
+    # ---- Поиск организаций ----
+    elif step == 'search_orgs':
+        context.user_data['step'] = None
+        city = db.get_setting('city') or 'Москва'
+        result = search_organizations(text, city=city)
+        await update.message.reply_text(
+            result,
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔍 Новый поиск", callback_data='search_orgs')],
+                [InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')]
+            ])
         )
     
     # ---- Добавление задачи с датой ----
@@ -658,7 +808,6 @@ async def add_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     data = query.data
     
-    # ---- Выбор категории ----
     if data.startswith('set_cat_'):
         category = data.replace('set_cat_', '')
         context.user_data['task_category'] = category
@@ -678,7 +827,6 @@ async def add_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data['step'] = 'add_task_priority'
     
-    # ---- Выбор приоритета ----
     elif data.startswith('priority_'):
         priority_map = {
             'priority_high': 'Высокий',
@@ -687,12 +835,10 @@ async def add_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         priority = priority_map.get(data, 'Средний')
         
-        # Получаем данные из контекста
         title = context.user_data.get('task_title', 'Без названия')
         category = context.user_data.get('task_category', 'Работа')
         due_date = context.user_data.get('task_date', None)
         
-        # Сохраняем задачу
         task_id = db.add_task(title, "", category, priority, due_date)
         
         context.user_data['step'] = None
@@ -716,16 +862,15 @@ async def add_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
     
-    # Обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(CallbackQueryHandler(add_task_callback, pattern='^(set_cat_|priority_)'))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     print("=" * 50)
-    print("🤖 Бот-планировщик запущен!")
+    print("🤖 Бот-планировщик с Яндекс API запущен!")
     print(f"👤 Админ ID: {ADMIN_ID}")
-    print("📋 Функции: Задачи, Календарь, Погода, Статистика")
+    print("📋 Функции: Задачи, Календарь, Погода, Поиск организаций")
     print("=" * 50)
     
     app.run_polling()
