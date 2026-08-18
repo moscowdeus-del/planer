@@ -34,7 +34,6 @@ except ImportError:
     from aiogram.dispatcher import FSMContext
     from aiogram.dispatcher.filters.state import State, StatesGroup
     from aiogram.contrib.fsm_storage.memory import MemoryStorage
-
 # ===================== КОНФИГУРАЦИЯ =====================
 BOT_TOKEN = "8811262187:AAEssO3CfPRKIXJW1Qh3Nxj-je-yKTBJLnc"  # ЗАМЕНИТЕ НА ВАШ ТОКЕН
 ADMINS = [1024761707]  # ЗАМЕНИТЕ НА ВАШ TELEGRAM ID
