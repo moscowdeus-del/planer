@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-HR-бот для анонимного Pulse-опроса сотрудников
-Оценка лояльности (eNPS) и вовлеченности
-Все ответы анонимны и доступны только админу
+HR-бот для анонимного Pulse-опроса
+Сбор: должность и стаж (без имени)
+Анонимная статистика для админа
 """
 
 import sqlite3
@@ -12,7 +12,7 @@ import random
 import time
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
 import sys
 
@@ -47,10 +47,7 @@ BOT_TOKEN = "8811262187:AAEssO3CfPRKIXJW1Qh3Nxj-je-yKTBJLnc"
 ADMINS = [1024761707]
 
 # ===================== ИНИЦИАЛИЗАЦИЯ =====================
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot, storage=storage)
@@ -58,14 +55,11 @@ dp.middleware.setup(LoggingMiddleware())
 
 # ===================== СОСТОЯНИЯ =====================
 class RegistrationStates(StatesGroup):
-    waiting_for_name = State()
-    waiting_for_department = State()
     waiting_for_position = State()
-    waiting_for_phone = State()
+    waiting_for_experience = State()
 
 class SurveyStates(StatesGroup):
     answering = State()
-    waiting_for_comment = State()
 
 class AdminStates(StatesGroup):
     waiting_for_broadcast = State()
@@ -74,7 +68,6 @@ class AdminStates(StatesGroup):
     waiting_for_question_edit_save = State()
     waiting_for_question_delete = State()
     waiting_for_admin_add = State()
-    waiting_for_feedback = State()
 
 # ===================== БАЗА ДАННЫХ =====================
 class Database:
@@ -82,21 +75,23 @@ class Database:
         self.conn = sqlite3.connect('hr_bot.db', check_same_thread=False)
         self.cursor = self.conn.cursor()
         self._create_tables()
-        self._create_indexes()
     
     def _create_tables(self):
-        # Сотрудники (личные данные)
+        # Сотрудники (только анонимные данные!)
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS employees (
                 user_id INTEGER PRIMARY KEY,
-                full_name TEXT,
-                department TEXT,
                 position TEXT,
-                phone TEXT,
-                registered_at TEXT,
-                is_admin INTEGER DEFAULT 0,
-                is_active INTEGER DEFAULT 1,
-                last_active TEXT
+                experience TEXT,
+                registered_at TEXT
+            )
+        ''')
+        
+        # Администраторы
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY,
+                added_at TEXT
             )
         ''')
         
@@ -105,31 +100,28 @@ class Database:
             CREATE TABLE IF NOT EXISTS survey_questions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 question_text TEXT,
-                category TEXT DEFAULT 'Лояльность',
                 is_active INTEGER DEFAULT 1,
                 created_at TEXT
             )
         ''')
         
-        # Ответы на пульс-опрос (АНОНИМНЫЕ - без user_id!)
+        # АНОНИМНЫЕ ответы (без user_id!)
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS survey_answers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 question_id INTEGER,
                 answer_score INTEGER,
-                comment TEXT,
-                date TEXT,
-                department TEXT,
-                user_hash TEXT
+                position TEXT,
+                experience TEXT,
+                date TEXT
             )
         ''')
         
-        # Для отслеживания, кто уже прошел опрос (без привязки к ответам)
+        # Для отслеживания участия
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS survey_participants (
                 user_id INTEGER PRIMARY KEY,
-                last_survey_date TEXT,
-                survey_hash TEXT
+                last_survey_date TEXT
             )
         ''')
         
@@ -139,96 +131,61 @@ class Database:
                 user_id INTEGER PRIMARY KEY,
                 questions TEXT,
                 current_index INTEGER,
-                total_answered INTEGER,
-                start_time INTEGER,
                 answers TEXT
             )
         ''')
-        
-        # Обратная связь (анонимная)
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS feedback (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                text TEXT,
-                rating INTEGER,
-                date TEXT,
-                department TEXT,
-                status TEXT DEFAULT 'new'
-            )
-        ''')
-        self.conn.commit()
-    
-    def _create_indexes(self):
-        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_answers_date ON survey_answers(date)')
-        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_answers_dept ON survey_answers(department)')
         self.conn.commit()
     
     # ---- Сотрудники ----
-    def register_employee(self, user_id, full_name, department, position, phone=None):
+    def register_employee(self, user_id, position, experience):
         self.cursor.execute('''
-            INSERT OR REPLACE INTO employees 
-            (user_id, full_name, department, position, phone, registered_at, last_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, full_name, department, position, phone, datetime.now().isoformat(), datetime.now().isoformat()))
+            INSERT OR REPLACE INTO employees (user_id, position, experience, registered_at)
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, position, experience, datetime.now().isoformat()))
         self.conn.commit()
-        return True
-    
-    def is_admin(self, user_id):
-        self.cursor.execute('SELECT is_admin FROM employees WHERE user_id = ?', (user_id,))
-        result = self.cursor.fetchone()
-        return result is not None and result[0] == 1
     
     def is_registered(self, user_id):
         self.cursor.execute('SELECT user_id FROM employees WHERE user_id = ?', (user_id,))
         return self.cursor.fetchone() is not None
     
     def get_employee(self, user_id):
-        self.cursor.execute('SELECT * FROM employees WHERE user_id = ?', (user_id,))
+        self.cursor.execute('SELECT position, experience FROM employees WHERE user_id = ?', (user_id,))
         return self.cursor.fetchone()
     
-    def get_all_employees(self):
-        self.cursor.execute('''
-            SELECT user_id, full_name, department, position, phone, is_active 
-            FROM employees ORDER BY full_name
-        ''')
-        return self.cursor.fetchall()
+    # ---- Админы ----
+    def is_admin(self, user_id):
+        self.cursor.execute('SELECT user_id FROM admins WHERE user_id = ?', (user_id,))
+        return self.cursor.fetchone() is not None
     
-    def set_admin(self, user_id, is_admin=True):
-        self.cursor.execute('UPDATE employees SET is_admin = ? WHERE user_id = ?', (1 if is_admin else 0, user_id))
+    def add_admin(self, user_id):
+        self.cursor.execute('INSERT OR IGNORE INTO admins (user_id, added_at) VALUES (?, ?)', 
+                           (user_id, datetime.now().isoformat()))
         self.conn.commit()
     
-    def update_active_status(self, user_id):
-        self.cursor.execute('UPDATE employees SET last_active = ? WHERE user_id = ?', 
-                           (datetime.now().isoformat(), user_id))
-        self.conn.commit()
+    def get_all_admins(self):
+        self.cursor.execute('SELECT user_id FROM admins')
+        return [row[0] for row in self.cursor.fetchall()]
     
-    def get_employee_department(self, user_id):
-        self.cursor.execute('SELECT department FROM employees WHERE user_id = ?', (user_id,))
-        result = self.cursor.fetchone()
-        return result[0] if result else None
-    
-    # ---- Вопросы для опроса ----
-    def add_survey_question(self, question_text, category="Лояльность"):
+    # ---- Вопросы ----
+    def add_question(self, question_text):
         self.cursor.execute('''
-            INSERT INTO survey_questions (question_text, category, created_at)
-            VALUES (?, ?, ?)
-        ''', (question_text, category, datetime.now().isoformat()))
+            INSERT INTO survey_questions (question_text, created_at)
+            VALUES (?, ?)
+        ''', (question_text, datetime.now().isoformat()))
         self.conn.commit()
         return self.cursor.lastrowid
     
-    def get_all_survey_questions(self):
+    def get_all_questions(self):
         self.cursor.execute('SELECT * FROM survey_questions WHERE is_active = 1 ORDER BY id')
         return self.cursor.fetchall()
     
     def get_question_by_id(self, question_id):
-        self.cursor.execute('SELECT * FROM survey_questions WHERE id = ?', (question_id,))
+        self.cursor.execute('SELECT * FROM survey_questions WHERE id = ? AND is_active = 1', (question_id,))
         return self.cursor.fetchone()
     
-    def update_question(self, question_id, question_text, category):
-        self.cursor.execute('''
-            UPDATE survey_questions SET question_text = ?, category = ?
-            WHERE id = ?
-        ''', (question_text, category, question_id))
+    def update_question(self, question_id, question_text):
+        self.cursor.execute('UPDATE survey_questions SET question_text = ? WHERE id = ?', 
+                           (question_text, question_id))
         self.conn.commit()
     
     def delete_question(self, question_id):
@@ -240,19 +197,19 @@ class Database:
         return self.cursor.fetchone()[0]
     
     # ---- Анонимные ответы ----
-    def save_anonymous_answer(self, question_id, answer_score, comment, department, user_hash):
+    def save_anonymous_answer(self, question_id, answer_score, position, experience):
         self.cursor.execute('''
-            INSERT INTO survey_answers (question_id, answer_score, comment, date, department, user_hash)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (question_id, answer_score, comment, datetime.now().isoformat(), department, user_hash))
+            INSERT INTO survey_answers (question_id, answer_score, position, experience, date)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (question_id, answer_score, position, experience, datetime.now().isoformat()))
         self.conn.commit()
         return self.cursor.lastrowid
     
-    def mark_participant(self, user_id, survey_hash):
+    def mark_participant(self, user_id):
         self.cursor.execute('''
-            INSERT OR REPLACE INTO survey_participants (user_id, last_survey_date, survey_hash)
-            VALUES (?, ?, ?)
-        ''', (user_id, datetime.now().isoformat(), survey_hash))
+            INSERT OR REPLACE INTO survey_participants (user_id, last_survey_date)
+            VALUES (?, ?)
+        ''', (user_id, datetime.now().isoformat()))
         self.conn.commit()
     
     def has_participated(self, user_id):
@@ -260,7 +217,8 @@ class Database:
         return self.cursor.fetchone() is not None
     
     def get_anonymous_stats(self):
-        """Получение анонимной статистики для админа"""
+        """Полная анонимная статистика для админа"""
+        
         # Общая статистика
         self.cursor.execute('''
             SELECT 
@@ -268,7 +226,7 @@ class Database:
                 AVG(answer_score) as avg_score,
                 MIN(answer_score) as min_score,
                 MAX(answer_score) as max_score,
-                COUNT(DISTINCT department) as dept_count
+                COUNT(DISTINCT position) as positions_count
             FROM survey_answers
         ''')
         general = self.cursor.fetchone()
@@ -282,63 +240,54 @@ class Database:
         ''')
         distribution = self.cursor.fetchall()
         
-        # По отделам
+        # По должностям
         self.cursor.execute('''
-            SELECT department, COUNT(*) as count, AVG(answer_score) as avg_score
+            SELECT position, COUNT(*) as count, AVG(answer_score) as avg_score
             FROM survey_answers
-            GROUP BY department
+            GROUP BY position
             ORDER BY avg_score DESC
         ''')
-        by_department = self.cursor.fetchall()
+        by_position = self.cursor.fetchall()
         
-        # Комментарии
+        # По стажу
         self.cursor.execute('''
-            SELECT comment, date, department
+            SELECT experience, COUNT(*) as count, AVG(answer_score) as avg_score
             FROM survey_answers
-            WHERE comment IS NOT NULL AND comment != ''
-            ORDER BY date DESC
-            LIMIT 20
+            GROUP BY experience
+            ORDER BY experience
         ''')
-        comments = self.cursor.fetchall()
+        by_experience = self.cursor.fetchall()
         
-        return general, distribution, by_department, comments
+        # eNPS (доля рекомендующих)
+        self.cursor.execute('''
+            SELECT 
+                SUM(CASE WHEN answer_score >= 9 THEN 1 ELSE 0 END) as promoters,
+                SUM(CASE WHEN answer_score <= 6 THEN 1 ELSE 0 END) as detractors,
+                COUNT(*) as total
+            FROM survey_answers
+        ''')
+        enps_data = self.cursor.fetchone()
+        
+        return general, distribution, by_position, by_experience, enps_data
     
     # ---- Активные опросы ----
-    def save_active_survey(self, user_id, question_ids, current_index, total_answered, start_time, answers):
+    def save_active_survey(self, user_id, question_ids, current_index, answers):
         self.cursor.execute('''
-            INSERT OR REPLACE INTO active_surveys (user_id, questions, current_index, total_answered, start_time, answers)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (user_id, json.dumps(question_ids), current_index, total_answered, start_time, json.dumps(answers)))
+            INSERT OR REPLACE INTO active_surveys (user_id, questions, current_index, answers)
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, json.dumps(question_ids), current_index, json.dumps(answers)))
         self.conn.commit()
     
     def get_active_survey(self, user_id):
-        self.cursor.execute('SELECT questions, current_index, total_answered, start_time, answers FROM active_surveys WHERE user_id = ?', (user_id,))
+        self.cursor.execute('SELECT questions, current_index, answers FROM active_surveys WHERE user_id = ?', (user_id,))
         result = self.cursor.fetchone()
         if result:
-            return json.loads(result[0]), result[1], result[2], result[3], json.loads(result[4])
-        return None, 0, 0, None, None
+            return json.loads(result[0]), result[1], json.loads(result[2])
+        return None, 0, None
     
     def clear_active_survey(self, user_id):
         self.cursor.execute('DELETE FROM active_surveys WHERE user_id = ?', (user_id,))
         self.conn.commit()
-    
-    # ---- Обратная связь (анонимная) ----
-    def save_anonymous_feedback(self, text, rating, department):
-        self.cursor.execute('''
-            INSERT INTO feedback (text, rating, date, department)
-            VALUES (?, ?, ?, ?)
-        ''', (text, rating, datetime.now().isoformat(), department))
-        self.conn.commit()
-        return self.cursor.lastrowid
-    
-    def get_all_feedback(self):
-        self.cursor.execute('''
-            SELECT id, text, rating, date, department, status
-            FROM feedback
-            ORDER BY date DESC
-            LIMIT 50
-        ''')
-        return self.cursor.fetchall()
 
 # ===================== БАЗА ДАННЫХ =====================
 db = Database()
@@ -349,20 +298,20 @@ def init_survey_questions():
         return
     
     questions = [
-        "Насколько вы удовлетворены своей работой в компании? (1-10)",
-        "Как вы оцениваете уровень поддержки со стороны руководства? (1-10)",
-        "Насколько вы чувствуете себя вовлеченным в жизнь компании? (1-10)",
-        "Как вы оцениваете возможности для профессионального роста? (1-10)",
-        "Насколько вы довольны уровнем заработной платы? (1-10)",
-        "Как вы оцениваете атмосферу в коллективе? (1-10)",
-        "Насколько вы довольны условиями труда? (1-10)",
-        "Как вы оцениваете баланс между работой и личной жизнью? (1-10)",
-        "Насколько вы гордитесь тем, что работаете в нашей компании? (1-10)",
-        "Порекомендовали бы вы нашу компанию как место работы друзьям? (1-10)"
+        "Насколько вы удовлетворены своей работой в компании?",
+        "Как вы оцениваете уровень поддержки со стороны руководства?",
+        "Насколько вы чувствуете себя вовлеченным в жизнь компании?",
+        "Как вы оцениваете возможности для профессионального роста?",
+        "Насколько вы довольны уровнем заработной платы?",
+        "Как вы оцениваете атмосферу в коллективе?",
+        "Насколько вы довольны условиями труда?",
+        "Как вы оцениваете баланс между работой и личной жизнью?",
+        "Насколько вы гордитесь тем, что работаете в нашей компании?",
+        "Порекомендовали бы вы нашу компанию как место работы друзьям?"
     ]
     
     for q in questions:
-        db.add_survey_question(q, "Лояльность")
+        db.add_question(q)
     
     logging.info(f"✅ Добавлено {len(questions)} вопросов для Pulse-опроса")
 
@@ -372,10 +321,6 @@ def get_main_keyboard(user_id):
     keyboard.add(
         KeyboardButton("📝 Пройти опрос"),
         KeyboardButton("📊 Статистика")
-    )
-    keyboard.add(
-        KeyboardButton("💬 Анонимный отзыв"),
-        KeyboardButton("ℹ️ Помощь")
     )
     
     if db.is_admin(user_id):
@@ -394,12 +339,8 @@ def get_admin_keyboard():
         KeyboardButton("❌ Удалить вопрос")
     )
     keyboard.add(
-        KeyboardButton("👥 Сотрудники"),
-        KeyboardButton("📊 Анонимная статистика")
-    )
-    keyboard.add(
-        KeyboardButton("👑 Назначить админа"),
-        KeyboardButton("💬 Отзывы")
+        KeyboardButton("📊 Анонимная статистика"),
+        KeyboardButton("👑 Назначить админа")
     )
     keyboard.add(KeyboardButton("🔙 Главное меню"))
     return keyboard
@@ -416,6 +357,11 @@ def get_rating_keyboard(question_id):
     
     return keyboard
 
+def get_back_keyboard():
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu"))
+    return keyboard
+
 # ===================== ОБРАБОТЧИКИ =====================
 @dp.message_handler(commands=['start'])
 async def start_command(message: types.Message):
@@ -427,101 +373,67 @@ async def start_command(message: types.Message):
             "Здесь вы можете анонимно оценить свою удовлетворенность работой.\n\n"
             "📌 *Важно:*\n"
             "✅ Все ответы полностью анонимны\n"
+            "✅ Мы не спрашиваем ваше имя\n"
             "✅ Данные видны только HR-отделу\n"
             "✅ Опрос занимает 2-3 минуты\n\n"
-            "Для начала заполните анкету:",
+            "Для начала укажите вашу *должность*:",
             parse_mode="Markdown"
         )
-        await message.answer("👤 Введите ваше *полное имя* (ФИО):", parse_mode="Markdown")
-        await RegistrationStates.waiting_for_name.set()
+        await RegistrationStates.waiting_for_position.set()
     else:
-        db.update_active_status(user_id)
-        employee = db.get_employee(user_id)
-        
         await message.answer(
-            f"👋 *С возвращением, {employee[1]}!*\n\n"
+            "👋 *С возвращением!*\n\n"
             "Выберите действие:",
             parse_mode="Markdown",
             reply_markup=get_main_keyboard(user_id)
         )
 
-# ===================== РЕГИСТРАЦИЯ =====================
-@dp.message_handler(state=RegistrationStates.waiting_for_name)
-async def process_name(message: types.Message, state: FSMContext):
-    await state.update_data(full_name=message.text)
-    await message.answer("🏢 Введите ваш *отдел*:", parse_mode="Markdown")
-    await RegistrationStates.waiting_for_department.set()
-
-@dp.message_handler(state=RegistrationStates.waiting_for_department)
-async def process_department(message: types.Message, state: FSMContext):
-    await state.update_data(department=message.text)
-    await message.answer("💼 Введите вашу *должность*:", parse_mode="Markdown")
-    await RegistrationStates.waiting_for_position.set()
-
+# ===================== РЕГИСТРАЦИЯ (только должность и стаж) =====================
 @dp.message_handler(state=RegistrationStates.waiting_for_position)
 async def process_position(message: types.Message, state: FSMContext):
     await state.update_data(position=message.text)
-    await message.answer("📱 *Поделитесь контактом* (или нажмите 'Пропустить'):", 
-                        parse_mode="Markdown",
-                        reply_markup=ReplyKeyboardMarkup(resize_keyboard=True).add(
-                            KeyboardButton("📱 Поделиться контактом", request_contact=True),
-                            KeyboardButton("⏭ Пропустить")
-                        ))
-    await RegistrationStates.waiting_for_phone.set()
-
-@dp.message_handler(content_types=['contact'], state=RegistrationStates.waiting_for_phone)
-async def process_phone_contact(message: types.Message, state: FSMContext):
-    phone = message.contact.phone_number
-    data = await state.get_data()
-    
-    db.register_employee(
-        message.from_user.id,
-        data['full_name'],
-        data['department'],
-        data['position'],
-        phone
+    await message.answer(
+        "📅 *Сколько вы работаете в компании?*\n\n"
+        "Выберите вариант:",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup(resize_keyboard=True, row_width=2).add(
+            KeyboardButton("Менее 3 месяцев"),
+            KeyboardButton("3-6 месяцев"),
+            KeyboardButton("6-12 месяцев"),
+            KeyboardButton("1-2 года"),
+            KeyboardButton("2-5 лет"),
+            KeyboardButton("Более 5 лет")
+        )
     )
+    await RegistrationStates.waiting_for_experience.set()
+
+@dp.message_handler(state=RegistrationStates.waiting_for_experience)
+async def process_experience(message: types.Message, state: FSMContext):
+    experience = message.text
+    valid_options = ["Менее 3 месяцев", "3-6 месяцев", "6-12 месяцев", "1-2 года", "2-5 лет", "Более 5 лет"]
+    
+    if experience not in valid_options:
+        await message.answer("❌ Пожалуйста, выберите вариант из списка:")
+        return
+    
+    data = await state.get_data()
+    position = data.get('position')
+    
+    db.register_employee(message.from_user.id, position, experience)
     
     await state.finish()
     await message.answer(
         f"✅ *Регистрация завершена!*\n\n"
-        f"👤 {data['full_name']}\n"
-        f"🏢 {data['department']}\n"
-        f"💼 {data['position']}\n\n"
-        "Теперь вы можете пройти анонимный опрос!",
+        f"📊 Должность: {position}\n"
+        f"📅 Стаж: {experience}\n\n"
+        "Все данные анонимны! 🕵️\n"
+        "Теперь вы можете пройти опрос.",
         parse_mode="Markdown",
         reply_markup=get_main_keyboard(message.from_user.id)
     )
 
-@dp.message_handler(state=RegistrationStates.waiting_for_phone)
-async def process_phone_skip(message: types.Message, state: FSMContext):
-    if message.text == "⏭ Пропустить":
-        data = await state.get_data()
-        db.register_employee(
-            message.from_user.id,
-            data['full_name'],
-            data['department'],
-            data['position']
-        )
-        
-        await state.finish()
-        await message.answer(
-            f"✅ *Регистрация завершена!*\n\n"
-            f"👤 {data['full_name']}\n"
-            f"🏢 {data['department']}\n"
-            f"💼 {data['position']}\n\n"
-            "Теперь вы можете пройти анонимный опрос!",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard(message.from_user.id)
-        )
-    else:
-        await message.answer("Используйте кнопку 'Поделиться контактом' или 'Пропустить'.")
-
 # ===================== ГЛАВНОЕ МЕНЮ =====================
-@dp.message_handler(lambda message: message.text in [
-    "📝 Пройти опрос", "📊 Статистика", "💬 Анонимный отзыв",
-    "ℹ️ Помощь", "⚙️ Админ-панель"
-])
+@dp.message_handler(lambda message: message.text in ["📝 Пройти опрос", "📊 Статистика", "⚙️ Админ-панель"])
 async def handle_menu(message: types.Message):
     user_id = message.from_user.id
     
@@ -530,26 +442,6 @@ async def handle_menu(message: types.Message):
     
     elif message.text == "📊 Статистика":
         await show_user_stats(message, user_id)
-    
-    elif message.text == "💬 Анонимный отзыв":
-        await message.answer(
-            "💬 *Анонимный отзыв*\n\n"
-            "Напишите ваши пожелания, идеи или замечания.\n"
-            "Ваше сообщение будет полностью анонимным!",
-            parse_mode="Markdown"
-        )
-        await AdminStates.waiting_for_feedback.set()
-    
-    elif message.text == "ℹ️ Помощь":
-        await message.answer(
-            "ℹ️ *Помощь*\n\n"
-            "📝 *Пройти опрос* - анонимная оценка лояльности (10 вопросов)\n"
-            "📊 *Статистика* - ваша личная статистика участия\n"
-            "💬 *Анонимный отзыв* - оставить анонимное сообщение\n"
-            "⚙️ *Админ-панель* - управление опросом (только для HR)\n\n"
-            "Все ответы полностью анонимны! 🕵️",
-            parse_mode="Markdown"
-        )
     
     elif message.text == "⚙️ Админ-панель":
         if db.is_admin(user_id):
@@ -562,36 +454,16 @@ async def handle_menu(message: types.Message):
         else:
             await message.answer("⛔ У вас нет прав администратора.")
 
-# ===================== АНОНИМНЫЙ ОТЗЫВ =====================
-@dp.message_handler(state=AdminStates.waiting_for_feedback)
-async def process_feedback(message: types.Message, state: FSMContext):
-    department = db.get_employee_department(message.from_user.id) or "Не указан"
-    
-    db.save_anonymous_feedback(
-        message.text,
-        rating=0,
-        department=department
-    )
-    
-    await state.finish()
-    await message.answer(
-        "✅ *Спасибо за ваш анонимный отзыв!* 🙌\n\n"
-        "Ваше мнение поможет нам стать лучше.",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard(message.from_user.id)
-    )
-
 # ===================== ОПРОС =====================
 async def start_survey(message: types.Message, user_id):
     if db.count_questions() == 0:
         await message.answer("❌ Вопросы для опроса еще не загружены.")
         return
     
-    # Проверяем, участвовал ли уже сегодня
     if db.has_participated(user_id):
         keyboard = InlineKeyboardMarkup()
         keyboard.add(
-            InlineKeyboardButton("✅ Пройти заново", callback_data="restart_survey"),
+            InlineKeyboardButton("🔄 Пройти заново", callback_data="restart_survey"),
             InlineKeyboardButton("🔙 В меню", callback_data="back_to_menu")
         )
         await message.answer(
@@ -602,20 +474,19 @@ async def start_survey(message: types.Message, user_id):
         )
         return
     
-    # Проверяем незавершенный опрос
-    questions, current_index, total_answered, start_time, answers = db.get_active_survey(user_id)
+    questions, current_index, answers = db.get_active_survey(user_id)
     
     if questions and current_index > 0 and current_index < len(questions):
         keyboard = InlineKeyboardMarkup()
         keyboard.add(
             InlineKeyboardButton("✅ Продолжить", callback_data="continue_survey"),
-            InlineKeyboardButton("🔄 Начать заново", callback_data="restart_survey")
+            InlineKeyboardButton("🔄 Начать заново", callback_data="restart_survey"),
+            InlineKeyboardButton("🔙 В меню", callback_data="back_to_menu")
         )
         await message.answer("⏳ У вас есть незавершенный опрос.", reply_markup=keyboard)
         return
     
-    # Начинаем новый опрос
-    all_questions = db.get_all_survey_questions()
+    all_questions = db.get_all_questions()
     
     await message.answer(
         "📝 *Анонимный Pulse-опрос*\n\n"
@@ -628,11 +499,11 @@ async def start_survey(message: types.Message, user_id):
     )
     
     question_ids = [q[0] for q in all_questions]
-    db.save_active_survey(user_id, question_ids, 0, 0, int(time.time()), [])
-    await send_survey_question(message, user_id, 0)
+    db.save_active_survey(user_id, question_ids, 0, [])
+    await send_question(message, user_id, 0)
 
-async def send_survey_question(message: types.Message, user_id, index):
-    questions, current_index, total_answered, start_time, answers = db.get_active_survey(user_id)
+async def send_question(message: types.Message, user_id, index):
+    questions, current_index, answers = db.get_active_survey(user_id)
     
     if not questions or index >= len(questions):
         await finish_survey(message, user_id)
@@ -659,42 +530,36 @@ async def handle_survey_answer(callback_query: types.CallbackQuery):
     rating = int(data[1])
     question_id = int(data[2])
     
-    questions, current_index, total_answered, start_time, answers = db.get_active_survey(user_id)
+    questions, current_index, answers = db.get_active_survey(user_id)
     
     if not questions:
         await callback_query.answer("❌ Опрос не найден")
         return
     
-    # Сохраняем ответ
     answers.append({
         'question_id': question_id,
-        'rating': rating,
-        'timestamp': time.time()
+        'rating': rating
     })
     
     current_index += 1
-    total_answered += 1
+    db.save_active_survey(user_id, questions, current_index, answers)
     
-    db.save_active_survey(user_id, questions, current_index, total_answered, start_time, answers)
-    
-    # Показываем подтверждение
     await callback_query.answer(f"✅ Оценка {rating} сохранена")
     
-    # Показываем следующий вопрос или завершаем
     if current_index >= len(questions):
         await finish_survey(callback_query.message, user_id)
     else:
         await callback_query.message.delete()
-        await send_survey_question(callback_query.message, user_id, current_index)
+        await send_question(callback_query.message, user_id, current_index)
 
 @dp.callback_query_handler(lambda c: c.data == 'continue_survey')
 async def continue_survey(callback_query: types.CallbackQuery):
     user_id = callback_query.from_user.id
-    questions, current_index, total_answered, start_time, answers = db.get_active_survey(user_id)
+    questions, current_index, answers = db.get_active_survey(user_id)
     
     await callback_query.answer()
     await callback_query.message.delete()
-    await send_survey_question(callback_query.message, user_id, current_index)
+    await send_question(callback_query.message, user_id, current_index)
 
 @dp.callback_query_handler(lambda c: c.data == 'restart_survey')
 async def restart_survey(callback_query: types.CallbackQuery):
@@ -711,42 +576,37 @@ async def back_to_menu_callback(callback_query: types.CallbackQuery):
     await callback_query.answer()
     await callback_query.message.delete()
     await callback_query.message.answer(
-        "🔙 Возврат в меню",
+        "🔙 Возврат в главное меню",
         reply_markup=get_main_keyboard(user_id)
     )
 
 async def finish_survey(message: types.Message, user_id):
-    questions, current_index, total_answered, start_time, answers = db.get_active_survey(user_id)
+    questions, current_index, answers = db.get_active_survey(user_id)
     
-    if not answers or total_answered == 0:
+    if not answers:
         await message.answer("❌ Опрос не был начат.")
         return
     
+    # Получаем данные сотрудника (анонимные)
+    employee = db.get_employee(user_id)
+    position = employee[0] if employee else "Не указана"
+    experience = employee[1] if employee else "Не указан"
+    
     # Сохраняем анонимные ответы
-    department = db.get_employee_department(user_id) or "Не указан"
-    
-    # Генерируем анонимный хэш для этого опроса
-    import hashlib
-    survey_hash = hashlib.md5(f"{user_id}{time.time()}".encode()).hexdigest()[:8]
-    
     for answer in answers:
         db.save_anonymous_answer(
             answer['question_id'],
             answer['rating'],
-            "",  # Комментарий пока пустой
-            department,
-            survey_hash
+            position,
+            experience
         )
     
-    # Отмечаем, что пользователь прошел опрос
-    db.mark_participant(user_id, survey_hash)
+    db.mark_participant(user_id)
     db.clear_active_survey(user_id)
     
-    # Рассчитываем средний балл
     total_score = sum(a['rating'] for a in answers)
     avg_score = total_score / len(answers)
     
-    # Определяем уровень лояльности
     if avg_score >= 8:
         level = "🟢 Высокий уровень лояльности!"
         emoji = "🌟"
@@ -762,13 +622,13 @@ async def finish_survey(message: types.Message, user_id):
         f"{emoji} {level}\n\n"
         f"📊 Ваш средний балл: {avg_score:.1f}/10\n"
         f"📝 Всего вопросов: {len(answers)}\n\n"
-        "Спасибо за участие! Ваше мнение важно для нас. 🙌\n\n"
+        "Спасибо за участие! 🙌\n"
         "Все ответы полностью анонимны! 🕵️",
         parse_mode="Markdown",
         reply_markup=get_main_keyboard(user_id)
     )
 
-# ===================== СТАТИСТИКА =====================
+# ===================== СТАТИСТИКА ДЛЯ ПОЛЬЗОВАТЕЛЯ =====================
 async def show_user_stats(message: types.Message, user_id):
     if db.has_participated(user_id):
         await message.answer(
@@ -789,8 +649,8 @@ async def show_user_stats(message: types.Message, user_id):
 # ===================== АДМИН-ПАНЕЛЬ =====================
 @dp.message_handler(lambda message: message.text in [
     "📢 Рассылка", "➕ Добавить вопрос", "✏️ Редактировать вопрос",
-    "❌ Удалить вопрос", "👥 Сотрудники", "📊 Анонимная статистика",
-    "👑 Назначить админа", "💬 Отзывы", "🔙 Главное меню"
+    "❌ Удалить вопрос", "📊 Анонимная статистика",
+    "👑 Назначить админа", "🔙 Главное меню"
 ])
 async def handle_admin_buttons(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -814,7 +674,7 @@ async def handle_admin_buttons(message: types.Message, state: FSMContext):
         await AdminStates.waiting_for_question_add.set()
     
     elif message.text == "✏️ Редактировать вопрос":
-        questions = db.get_all_survey_questions()
+        questions = db.get_all_questions()
         if not questions:
             await message.answer("❌ Вопросов нет.")
             return
@@ -827,7 +687,7 @@ async def handle_admin_buttons(message: types.Message, state: FSMContext):
         await AdminStates.waiting_for_question_edit.set()
     
     elif message.text == "❌ Удалить вопрос":
-        questions = db.get_all_survey_questions()
+        questions = db.get_all_questions()
         if not questions:
             await message.answer("❌ Вопросов нет.")
             return
@@ -839,27 +699,10 @@ async def handle_admin_buttons(message: types.Message, state: FSMContext):
         await message.answer(text, parse_mode="Markdown")
         await AdminStates.waiting_for_question_delete.set()
     
-    elif message.text == "👥 Сотрудники":
-        employees = db.get_all_employees()
-        if not employees:
-            await message.answer("👥 Нет сотрудников.")
-            return
-        
-        text = "👥 *Список сотрудников*\n\n"
-        for user_id, name, dept, pos, phone, active in employees:
-            status = "🟢" if active else "🔴"
-            text += f"{status} *{name}*\n"
-            text += f"   📊 {dept} | {pos}\n"
-            if phone:
-                text += f"   📱 {phone}\n"
-            text += "\n"
-        
-        await message.answer(text, parse_mode="Markdown")
-    
     elif message.text == "📊 Анонимная статистика":
-        general, distribution, by_department, comments = db.get_anonymous_stats()
+        general, distribution, by_position, by_experience, enps_data = db.get_anonymous_stats()
         
-        text = "📊 *Анонимная статистика Pulse-опроса*\n"
+        text = "📊 *АНОНИМНАЯ СТАТИСТИКА PULSE-ОПРОСА*\n"
         text += "*Все данные анонимны*\n\n"
         
         if general:
@@ -867,7 +710,20 @@ async def handle_admin_buttons(message: types.Message, state: FSMContext):
             text += f"📈 Средний балл: {general[1] or 0:.1f}/10\n"
             text += f"📉 Минимальный балл: {general[2] or 0}\n"
             text += f"📈 Максимальный балл: {general[3] or 0}\n"
-            text += f"🏢 Отделов: {general[4] or 0}\n\n"
+            text += f"👥 Должностей: {general[4] or 0}\n\n"
+        
+        # eNPS
+        if enps_data:
+            promoters = enps_data[0] or 0
+            detractors = enps_data[1] or 0
+            total = enps_data[2] or 0
+            enps_score = round(((promoters - detractors) / total) * 100, 1) if total > 0 else 0
+            
+            text += f"📊 *eNPS (Лояльность):*\n"
+            text += f"🌟 Промоутеры (9-10): {promoters}\n"
+            text += f"😐 Нейтралы (7-8): {total - promoters - detractors}\n"
+            text += f"🔴 Критики (0-6): {detractors}\n"
+            text += f"📈 eNPS: {enps_score}\n\n"
         
         # Распределение оценок
         if distribution:
@@ -877,64 +733,47 @@ async def handle_admin_buttons(message: types.Message, state: FSMContext):
                 text += f"{score} баллов: {bar} ({count})\n"
             text += "\n"
         
-        # По отделам
-        if by_department:
-            text += "🏢 *По отделам:*\n"
-            for dept, count, avg_score in by_department:
-                text += f"📊 {dept}: {avg_score:.1f}/10 ({count} ответов)\n"
+        # По должностям
+        if by_position:
+            text += "👔 *По должностям:*\n"
+            for position, count, avg_score in by_position[:10]:
+                text += f"📊 {position}: {avg_score:.1f}/10 ({count} чел.)\n"
             text += "\n"
         
-        # Комментарии
-        if comments:
-            text += "💬 *Анонимные комментарии:*\n\n"
-            for comment, date, dept in comments[:10]:
-                d = datetime.fromisoformat(date).strftime("%d.%m %H:%M")
-                text += f"📝 {comment[:200]}\n"
-                text += f"   🏢 {dept} | 🕐 {d}\n\n"
+        # По стажу
+        if by_experience:
+            text += "📅 *По стажу:*\n"
+            for experience, count, avg_score in by_experience:
+                text += f"📊 {experience}: {avg_score:.1f}/10 ({count} чел.)\n"
         
         await message.answer(text, parse_mode="Markdown")
     
     elif message.text == "👑 Назначить админа":
-        employees = db.get_all_employees()
-        text = "👑 *Назначение администратора*\n\nВведите ID пользователя:\n\n"
-        for user_id, name, dept, pos, phone, active in employees[:10]:
-            is_admin = db.is_admin(user_id)
-            status = "✅ Админ" if is_admin else "👤 Сотрудник"
-            text += f"ID: `{user_id}` | {name} | {status}\n"
-        await message.answer(text, parse_mode="Markdown")
+        await message.answer(
+            "👑 *Назначение администратора*\n\n"
+            "Введите Telegram ID пользователя:",
+            parse_mode="Markdown"
+        )
         await AdminStates.waiting_for_admin_add.set()
-    
-    elif message.text == "💬 Отзывы":
-        feedbacks = db.get_all_feedback()
-        if not feedbacks:
-            await message.answer("💬 Нет отзывов.")
-            return
-        
-        text = "💬 *Анонимные отзывы*\n\n"
-        for fb in feedbacks[:20]:
-            date = datetime.fromisoformat(fb[3]).strftime("%d.%m %H:%M")
-            text += f"📝 {fb[1][:200]}\n"
-            text += f"   🏢 {fb[4]} | 🕐 {date}\n\n"
-        
-        await message.answer(text, parse_mode="Markdown")
 
 # ===================== АДМИН: РАССЫЛКА =====================
 @dp.message_handler(state=AdminStates.waiting_for_broadcast)
 async def process_broadcast(message: types.Message, state: FSMContext):
-    employees = db.get_all_employees()
+    # Получаем всех зарегистрированных пользователей
+    db.cursor.execute('SELECT user_id FROM employees')
+    users = db.cursor.fetchall()
     sent = 0
     
-    for user_id, name, dept, pos, phone, active in employees:
-        if active:
-            try:
-                await bot.send_message(
-                    user_id,
-                    f"📢 *Объявление HR-отдела*\n\n{message.text}",
-                    parse_mode="Markdown"
-                )
-                sent += 1
-            except:
-                pass
+    for user_id in users:
+        try:
+            await bot.send_message(
+                user_id[0],
+                f"📢 *Объявление HR-отдела*\n\n{message.text}",
+                parse_mode="Markdown"
+            )
+            sent += 1
+        except:
+            pass
     
     await state.finish()
     await message.answer(f"✅ Рассылка отправлена {sent} сотрудникам.", reply_markup=get_admin_keyboard())
@@ -942,7 +781,7 @@ async def process_broadcast(message: types.Message, state: FSMContext):
 # ===================== АДМИН: ВОПРОСЫ =====================
 @dp.message_handler(state=AdminStates.waiting_for_question_add)
 async def process_add_question(message: types.Message, state: FSMContext):
-    db.add_survey_question(message.text)
+    db.add_question(message.text)
     await state.finish()
     await message.answer("✅ Вопрос добавлен!", reply_markup=get_admin_keyboard())
 
@@ -972,7 +811,7 @@ async def process_edit_question_save(message: types.Message, state: FSMContext):
         data = await state.get_data()
         question_id = data.get('edit_id')
         
-        db.update_question(question_id, message.text, "Лояльность")
+        db.update_question(question_id, message.text)
         await state.finish()
         await message.answer("✅ Вопрос обновлен!", reply_markup=get_admin_keyboard())
     except Exception as e:
@@ -997,15 +836,10 @@ async def process_delete_question(message: types.Message, state: FSMContext):
 async def process_assign_admin(message: types.Message, state: FSMContext):
     try:
         user_id = int(message.text.strip())
-        employee = db.get_employee(user_id)
         
-        if not employee:
-            await message.answer("❌ Пользователь не найден.")
-            return
-        
-        db.set_admin(user_id, True)
+        db.add_admin(user_id)
         await state.finish()
-        await message.answer(f"✅ {employee[1]} назначен администратором!", reply_markup=get_admin_keyboard())
+        await message.answer(f"✅ Пользователь {user_id} назначен администратором!", reply_markup=get_admin_keyboard())
         
         try:
             await bot.send_message(
@@ -1039,6 +873,10 @@ if __name__ == "__main__":
     print("=" * 50)
     
     try:
+        # Добавляем админов из списка
+        for admin_id in ADMINS:
+            db.add_admin(admin_id)
+        
         # Инициализация вопросов
         init_survey_questions()
         
