@@ -44,7 +44,7 @@ except ImportError:
 
 # ===================== КОНФИГУРАЦИЯ =====================
 BOT_TOKEN = "8811262187:AAEssO3CfPRKIXJW1Qh3Nxj-je-yKTBJLnc"
-ADMINS = [1024761707
+ADMINS = [1024761707]
 
 # ===================== ИНИЦИАЛИЗАЦИЯ =====================
 logging.basicConfig(
